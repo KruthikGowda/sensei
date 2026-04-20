@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Pulkit Verma"}]
 requires-python = ">=3.9"
-keywords = ["code-review", "gitlab", "claude", "ai", "merge-request", "cli"]
+keywords = ["code-review", "gitlab", "claude", "codex", "ai", "merge-request", "cli"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

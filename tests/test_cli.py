@@ -13,12 +13,16 @@ def test_learn_command_exists():
     runner = CliRunner()
     result = runner.invoke(main, ["learn", "--help"])
     assert result.exit_code == 0
+    assert "--codex" in result.output
+    assert "--claude" in result.output
 
 
 def test_review_command_exists():
     runner = CliRunner()
     result = runner.invoke(main, ["review", "--help"])
     assert result.exit_code == 0
+    assert "--codex" in result.output
+    assert "--claude" in result.output
 
 
 from unittest.mock import patch, MagicMock
@@ -31,6 +35,25 @@ def test_review_batch_command_exists():
     assert "concurrency" in result.output
     assert "dry-run" in result.output
     assert "--file" in result.output
+
+
+def test_set_ai_command_exists():
+    runner = CliRunner()
+    result = runner.invoke(main, ["set-ai", "--help"])
+    assert result.exit_code == 0
+    assert "--ai-cli" in result.output
+
+
+def test_use_command_exists():
+    runner = CliRunner()
+    result = runner.invoke(main, ["use", "--help"])
+    assert result.exit_code == 0
+
+
+def test_doctor_command_exists():
+    runner = CliRunner()
+    result = runner.invoke(main, ["doctor", "--help"])
+    assert result.exit_code == 0
 
 
 def test_review_batch_from_file(tmp_path):
@@ -112,3 +135,83 @@ def test_post_review_results_posts_musts_inline():
     )
     assert inline_posted >= 1
     mock_client.post_inline_comment.assert_called_once()
+
+
+def test_set_ai_updates_config(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".sensei"
+    monkeypatch.setattr("sensei.config.CONFIG_DIR", config_dir)
+
+    from sensei.config import init_config
+
+    init_config(gitlab_pat="glpat-test123", username="testuser")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["set-ai", "--ai-cli", "codex", "--no-fallback-ai"])
+
+    assert result.exit_code == 0
+    assert "ai=codex" in result.output
+
+    from sensei.config import load_config
+
+    config = load_config()
+    assert config["ai_cli"] == "codex"
+    assert config["fallback_ai_cli"] is False
+
+
+def test_doctor_reports_backend_status(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".sensei"
+    monkeypatch.setattr("sensei.config.CONFIG_DIR", config_dir)
+
+    from sensei.config import init_config
+
+    init_config(gitlab_pat="glpat-test123", username="testuser")
+    monkeypatch.setattr(
+        "sensei.cli.resolve_ai_cli_candidates",
+        lambda config=None: ["codex", "claude"],
+    )
+    monkeypatch.setattr(
+        "sensei.cli.get_ai_cli_status",
+        lambda provider: {
+            "label": provider.title(),
+            "installed": True,
+            "authenticated": provider == "codex",
+            "detail": "ok",
+            "path": f"/tmp/{provider}",
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "Resolved order: codex, claude" in result.output
+    assert "Codex: installed=yes, authenticated=yes" in result.output
+
+
+def test_use_command_updates_config(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".sensei"
+    monkeypatch.setattr("sensei.config.CONFIG_DIR", config_dir)
+
+    from sensei.config import init_config, load_config
+
+    init_config(gitlab_pat="glpat-test123", username="testuser")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["use", "codex"])
+
+    assert result.exit_code == 0
+    assert "Now using codex" in result.output
+
+    config = load_config()
+    assert config["ai_cli"] == "codex"
+
+
+def test_apply_ai_overrides_changes_runtime_config():
+    from sensei.cli import _apply_ai_overrides
+
+    config = {"ai_cli": "claude", "model": "", "_resolved_ai_cli_candidates": ["claude"]}
+    runtime_config = _apply_ai_overrides(config, "codex", "gpt-5.2")
+
+    assert runtime_config["ai_cli"] == "codex"
+    assert runtime_config["model"] == "gpt-5.2"
+    assert "_resolved_ai_cli_candidates" not in runtime_config

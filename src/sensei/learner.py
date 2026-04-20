@@ -1,7 +1,7 @@
-import subprocess
 from pathlib import Path
 import gitlab
 from sensei.config import CONFIG_DIR
+from sensei.llm_cli import run_prompt
 
 
 def fetch_user_comments(gl: gitlab.Gitlab, username: str, since: str) -> list:
@@ -58,21 +58,12 @@ Comments:
 Output a structured style profile in markdown format."""
 
 
-def analyze_with_claude(prompt: str) -> str:
-    """Run a prompt through claude CLI and return the output."""
-    result = subprocess.run(
-        ["claude", "-p", "--output-format", "text"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Claude CLI failed (exit code {result.returncode}).")
-    return result.stdout.strip()
+def analyze_with_ai(prompt: str, ai_config: dict) -> str:
+    """Run a prompt through the configured AI CLI and return the output."""
+    return run_prompt(prompt, timeout=120, config=ai_config)
 
 
-def build_style_profile(comments: list) -> str:
+def build_style_profile(comments: list, ai_config: dict) -> str:
     """Analyze comments in batches, then synthesize a final profile."""
     chunks = chunk_comments(comments, batch_size=50)
     partial_analyses = []
@@ -80,7 +71,7 @@ def build_style_profile(comments: list) -> str:
     for i, chunk in enumerate(chunks):
         print(f"  Analyzing batch {i + 1}/{len(chunks)}...")
         prompt = build_analysis_prompt(chunk)
-        analysis = analyze_with_claude(prompt)
+        analysis = analyze_with_ai(prompt, ai_config)
         partial_analyses.append(analysis)
 
     if len(partial_analyses) == 1:
@@ -101,7 +92,7 @@ Partial analyses:
 
 {"---".join(partial_analyses)}"""
 
-    return analyze_with_claude(synthesis_prompt)
+    return analyze_with_ai(synthesis_prompt, ai_config)
 
 
 def save_style_profile(profile: str) -> Path:

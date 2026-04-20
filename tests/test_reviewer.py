@@ -1,4 +1,4 @@
-from sensei.reviewer import build_file_review_prompt, parse_json_review, parse_review_output, consolidate_test_comments, load_project_rules_from_repo, _has_error_handling
+from sensei.reviewer import build_file_review_prompt, parse_json_review, parse_review_output, consolidate_test_comments, load_project_rules_from_repo, _has_error_handling, review_file
 
 
 def test_build_file_review_prompt_includes_diff():
@@ -16,6 +16,41 @@ def test_build_file_review_prompt_includes_diff():
     assert "type hints" in prompt
     assert "Code Review:" in prompt  # example format
     assert '"type"' in prompt  # new type field in output format
+
+
+def test_build_file_review_prompt_uses_diff_only_for_lockfiles():
+    prompt = build_file_review_prompt(
+        file_path="yarn.lock",
+        diff="+ foo@1.0.0",
+        file_content="x" * 5000,
+        style_profile="Priorities: readability",
+        project_rules="Use type hints everywhere",
+        mr_context="MR: refresh dependencies",
+    )
+    assert "generated file omitted to keep review fast" in prompt
+    assert "Generated file detected. Review the diff directly" in prompt
+
+
+def test_build_file_review_prompt_truncates_large_files_to_changed_context():
+    file_content = "\n".join(
+        [f"line {index}" for index in range(1, 4001)]
+    )
+    diff = "@@ -1198,3 +1200,4 @@\n+new logic\n@@ -2998,3 +3000,4 @@\n+other logic"
+
+    prompt = build_file_review_prompt(
+        file_path="src/big_file.ts",
+        diff=diff,
+        file_content=file_content,
+        style_profile="Priorities: readability",
+        project_rules="Use type hints everywhere",
+        mr_context="MR: update big file",
+    )
+
+    assert "Relevant file context near changed lines" in prompt
+    assert "# Lines 1180-1223" in prompt
+    assert "# Lines 2980-3023" in prompt
+    assert "line 1\nline 2\nline 3" not in prompt
+    assert "line 3998\nline 3999\nline 4000" not in prompt
 
 
 def test_parse_json_review_new_format():
@@ -95,6 +130,13 @@ def test_parse_json_review_handles_markdown_wrapped():
     assert comments[0]["type"] == "nit"
 
 
+def test_parse_json_review_handles_object_wrapped_comments():
+    raw = '{"comments":[{"line":5,"confidence":85,"type":"nit","comment":"Code Review: Bad name."}]}'
+    comments = parse_json_review(raw, "src/foo.py")
+    assert len(comments) == 1
+    assert comments[0]["type"] == "nit"
+
+
 def test_parse_review_output_lgtm():
     raw = "LGTM"
     comments = parse_review_output(raw, "src/auth.py")
@@ -166,3 +208,42 @@ def test_consolidate_test_comments_deduplicates():
 def test_load_project_rules_from_repo_returns_string():
     result = load_project_rules_from_repo(None, "fake/project", "main")
     assert isinstance(result, str)
+
+
+def test_load_project_rules_from_repo_includes_agents_md():
+    class FakeClient:
+        def get_file_content(self, project_path, rule_file, ref):
+            if rule_file == "AGENTS.md":
+                return "Use Optional from typing."
+            return ""
+
+    result = load_project_rules_from_repo(FakeClient(), "fake/project", "main")
+    assert "# From AGENTS.md" in result
+    assert "Use Optional from typing." in result
+
+
+def test_review_file_preserves_comment_types_for_any_provider(monkeypatch):
+    responses = iter([
+        '[{"line": 12, "confidence": 95, "type": "must", "comment": "Code Review: Bug."}, {"line": 18, "confidence": 84, "type": "test", "comment": "Needs tests."}]',
+        '[{"line": 12, "confidence": 91, "type": "must", "comment": "Code Review: Duplicate bug."}, {"line": 22, "confidence": 86, "type": "nit", "comment": "Code Review: Error handling could be clearer."}]',
+    ])
+
+    monkeypatch.setattr(
+        "sensei.reviewer.run_prompt",
+        lambda prompt, timeout, config, schema, reasoning_effort=None: next(responses),
+    )
+
+    comments = review_file(
+        file_path="src/foo.py",
+        diff="try { risky() } catch (err) { handle(err) }",
+        file_content="def foo():\n    pass",
+        style_profile="direct",
+        project_rules="rules",
+        mr_context="mr",
+        ai_config={"ai_cli": "codex"},
+    )
+
+    assert [comment["type"] for comment in comments] == ["must", "test", "nit"]
+    assert comments[0]["line"] == 12
+    assert comments[1]["line"] == 18
+    assert comments[2]["line"] == 22

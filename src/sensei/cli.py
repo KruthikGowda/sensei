@@ -1,6 +1,12 @@
 from pathlib import Path
 from typing import Callable, Optional
 import click
+from sensei.llm_cli import (
+    AI_CLI_CHOICES,
+    get_ai_cli_status,
+    get_ai_label,
+    resolve_ai_cli_candidates,
+)
 
 
 @click.group()
@@ -9,19 +15,154 @@ def main():
     pass
 
 
+def _apply_ai_overrides(
+    config: dict,
+    ai_cli_override: Optional[str] = None,
+    model_override: Optional[str] = None,
+) -> dict:
+    runtime_config = dict(config)
+    if ai_cli_override:
+        runtime_config["ai_cli"] = ai_cli_override
+        runtime_config.pop("_resolved_ai_cli_candidates", None)
+    if model_override is not None:
+        runtime_config["model"] = model_override
+    return runtime_config
+
+
 @main.command()
 @click.option("--pat", prompt="GitLab PAT", hide_input=True, help="Your GitLab Personal Access Token")
 @click.option("--url", default="https://gitlab.com", help="GitLab instance URL")
 @click.option("--username", default="", help="GitLab username (auto-detected if omitted)")
-def init(pat, url, username):
+@click.option(
+    "--ai-cli",
+    default="auto",
+    type=click.Choice(AI_CLI_CHOICES, case_sensitive=False),
+    show_default=True,
+    help="AI CLI backend to use for reviews and learning",
+)
+@click.option("--model", default="", help="Optional model override for the selected AI CLI")
+@click.option(
+    "--fallback-ai/--no-fallback-ai",
+    default=True,
+    show_default=True,
+    help="Fallback to the other installed AI CLI on auth/quota style failures",
+)
+def init(pat, url, username, ai_cli, model, fallback_ai):
     """Initialize Sensei with your GitLab credentials."""
     from sensei.config import init_config
-    config = init_config(gitlab_pat=pat, gitlab_url=url, username=username)
-    click.echo(f"Config saved to ~/.sensei/config.yaml (user: {config['username']})")
+    config = init_config(
+        gitlab_pat=pat,
+        gitlab_url=url,
+        username=username,
+        ai_cli=ai_cli,
+        model=model,
+        fallback_ai_cli=fallback_ai,
+    )
+    click.echo(
+        f"Config saved to ~/.sensei/config.yaml "
+        f"(user: {config['username']}, ai: {config['ai_cli']}, "
+        f"fallback: {'on' if config['fallback_ai_cli'] else 'off'})"
+    )
+
+
+@main.command("set-ai")
+@click.option(
+    "--ai-cli",
+    required=True,
+    type=click.Choice(AI_CLI_CHOICES, case_sensitive=False),
+    help="Preferred AI CLI backend",
+)
+@click.option("--model", default=None, help="Optional model override")
+@click.option(
+    "--fallback-ai/--no-fallback-ai",
+    default=None,
+    help="Enable or disable automatic fallback to the other installed AI CLI",
+)
+def set_ai(ai_cli, model, fallback_ai):
+    """Update the configured AI backend without rerunning init."""
+    from sensei.config import load_config, save_config
+
+    config = load_config()
+    config["ai_cli"] = ai_cli
+    if model is not None:
+        config["model"] = model
+    if fallback_ai is not None:
+        config["fallback_ai_cli"] = fallback_ai
+
+    path = save_config(config)
+    click.echo(
+        f"Updated AI settings in {path}: "
+        f"ai={config['ai_cli']}, model={config.get('model', '') or 'default'}, "
+        f"fallback={'on' if config.get('fallback_ai_cli', True) else 'off'}"
+    )
+
+
+@main.command("use")
+@click.argument("ai_cli", type=click.Choice(AI_CLI_CHOICES, case_sensitive=False))
+@click.option("--model", default=None, help="Optional model override")
+@click.option(
+    "--fallback-ai/--no-fallback-ai",
+    default=None,
+    help="Enable or disable automatic fallback to the other installed AI CLI",
+)
+def use_ai(ai_cli, model, fallback_ai):
+    """Shortcut for switching the preferred AI backend."""
+    from sensei.config import load_config, save_config
+
+    config = load_config()
+    config["ai_cli"] = ai_cli
+    if model is not None:
+        config["model"] = model
+    if fallback_ai is not None:
+        config["fallback_ai_cli"] = fallback_ai
+
+    path = save_config(config)
+    click.echo(
+        f"Now using {config['ai_cli']} "
+        f"(model: {config.get('model', '') or 'default'}, "
+        f"fallback: {'on' if config.get('fallback_ai_cli', True) else 'off'}) "
+        f"[{path}]"
+    )
 
 
 @main.command()
-def learn():
+def doctor():
+    """Show AI CLI availability and auth health."""
+    from sensei.config import load_config
+
+    config = load_config()
+    configured_ai = config.get("ai_cli", "auto")
+    click.echo("Sensei AI Doctor")
+    click.echo(f"Configured backend: {configured_ai}")
+    click.echo(f"Configured model: {config.get('model', '') or 'default'}")
+    click.echo(
+        f"Fallback enabled: {'yes' if config.get('fallback_ai_cli', True) else 'no'}"
+    )
+
+    try:
+        candidates = resolve_ai_cli_candidates(dict(config))
+        click.echo(f"Resolved order: {', '.join(candidates)}")
+    except RuntimeError as exc:
+        click.echo(f"Resolved order: unavailable ({exc})")
+
+    for provider in ("codex", "claude"):
+        status = get_ai_cli_status(provider)
+        installed = "yes" if status["installed"] else "no"
+        authenticated = "yes" if status.get("authenticated") else "no"
+        click.echo(
+            f"{status['label']}: installed={installed}, authenticated={authenticated}"
+        )
+        if status.get("path"):
+            click.echo(f"  path: {status['path']}")
+        click.echo(f"  detail: {status.get('detail', 'Unknown')}")
+
+
+@main.command()
+@click.option("--codex", "ai_cli_override", flag_value="codex", default=None, help="Use Codex for this run")
+@click.option("--claude", "ai_cli_override", flag_value="claude", help="Use Claude for this run")
+@click.option("--auto-ai", "ai_cli_override", flag_value="auto", help="Use auto backend selection for this run")
+@click.option("--model", "model_override", default=None, help="Optional model override for this run")
+def learn(ai_cli_override, model_override):
     """Scrape your GitLab comments and build a review style profile."""
     import gitlab as gl_module
     from datetime import datetime, timedelta
@@ -33,6 +174,8 @@ def learn():
     )
 
     config = load_config()
+    config = _apply_ai_overrides(config, ai_cli_override, model_override)
+    config["_status_callback"] = click.echo
     click.echo("Connecting to GitLab...")
     gl = gl_module.Gitlab(config["gitlab_url"], private_token=config["gitlab_pat"])
     gl.auth()
@@ -46,8 +189,8 @@ def learn():
         click.echo("No comments found. Nothing to learn from.")
         return
 
-    click.echo("Analyzing your review style with Claude...")
-    profile = build_style_profile(comments)
+    click.echo(f"Analyzing your review style with {get_ai_label(config)}...")
+    profile = build_style_profile(comments, config)
     path = save_style_profile(profile)
     click.echo(f"Style profile saved to {path}")
 
@@ -83,6 +226,12 @@ def _review_single_mr(
     }
 
     try:
+        runtime_config = dict(config)
+        if progress_callback:
+            runtime_config["_status_callback"] = lambda message: progress_callback(
+                mr_iid, project_path, message
+            )
+
         if progress_callback:
             progress_callback(mr_iid, project_path, "fetching MR data")
 
@@ -124,6 +273,7 @@ def _review_single_mr(
             style_profile=style_profile,
             project_rules=project_rules,
             mr_context=mr_context,
+            ai_config=runtime_config,
             batch_size=config.get("batch_size", 30),
         )
 
@@ -284,7 +434,11 @@ def _handle_approval(client, result: dict, dry_run: bool) -> None:
 @main.command()
 @click.argument("mr_url")
 @click.option("--dry-run", is_flag=True, help="Show review without posting option")
-def review(mr_url, dry_run):
+@click.option("--codex", "ai_cli_override", flag_value="codex", default=None, help="Use Codex for this run")
+@click.option("--claude", "ai_cli_override", flag_value="claude", help="Use Claude for this run")
+@click.option("--auto-ai", "ai_cli_override", flag_value="auto", help="Use auto backend selection for this run")
+@click.option("--model", "model_override", default=None, help="Optional model override for this run")
+def review(mr_url, dry_run, ai_cli_override, model_override):
     """Review a GitLab Merge Request."""
     from sensei.config import load_config
     from sensei.gitlab_client import parse_mr_url, validate_mr_url_origin, GitLabClient, extract_diff_lines
@@ -298,6 +452,8 @@ def review(mr_url, dry_run):
     from sensei.formatter import format_review, format_for_gitlab, format_inline_comment, format_nits_summary
 
     config = load_config()
+    config = _apply_ai_overrides(config, ai_cli_override, model_override)
+    config["_status_callback"] = lambda message: click.echo(message, err=True)
     try:
         project_path, mr_iid = parse_mr_url(mr_url)
         validate_mr_url_origin(mr_url, config["gitlab_url"])
@@ -340,13 +496,14 @@ def review(mr_url, dry_run):
     )
 
     # Review
-    click.echo("Reviewing files with Claude...")
+    click.echo(f"Reviewing files with {get_ai_label(config)}...")
     all_comments = review_mr_files(
         files=mr_data["files"],
         file_contents=file_contents,
         style_profile=style_profile,
         project_rules=project_rules,
         mr_context=mr_context,
+        ai_config=config,
         batch_size=config.get("batch_size", 30),
     )
 
