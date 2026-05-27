@@ -1,5 +1,6 @@
 from click.testing import CliRunner
 from sensei.cli import main
+from sensei.gitlab_client import build_body_signature, build_inline_signature
 
 
 def test_cli_help():
@@ -135,6 +136,70 @@ def test_post_review_results_posts_musts_inline():
     )
     assert inline_posted >= 1
     mock_client.post_inline_comment.assert_called_once()
+
+
+def test_post_review_results_does_not_skip_due_to_body_prefix_collision():
+    mock_client = MagicMock()
+    comment_body = (
+        "Code Review: " + ("A" * 120) + " real difference at the end"
+    )
+    comments = [{
+        "file": "src/app.tsx",
+        "line": 10,
+        "confidence": 95,
+        "type": "must",
+        "body": comment_body,
+    }]
+    diff_lines_map = {"src/app.tsx": {10}}
+    mr_data = {"base_sha": "a", "head_sha": "b", "start_sha": "c", "files": []}
+
+    existing = {
+        build_body_signature(
+            "Code Review: " + ("A" * 120) + " different existing comment"
+        )
+    }
+
+    from sensei.cli import _post_review_results
+    inline_posted, nits_posted, test_posted, skipped = _post_review_results(
+        client=mock_client, project_path="org/proj", mr_iid=1,
+        mr_data=mr_data, comments=comments, test_summary=None,
+        diff_lines_map=diff_lines_map, existing=existing,
+    )
+
+    assert (inline_posted, nits_posted, test_posted, skipped) == (1, 0, 0, 0)
+    mock_client.post_inline_comment.assert_called_once()
+
+
+def test_post_review_results_skips_existing_general_summary_comments():
+    mock_client = MagicMock()
+    comments = [{
+        "file": "src/app.tsx",
+        "line": 10,
+        "confidence": 82,
+        "type": "nit",
+        "body": "Rename this helper.",
+    }]
+    test_summary = "## Test Coverage Gaps\n\nMissing regression coverage."
+
+    from sensei.formatter import format_nits_summary
+    from sensei.cli import _post_review_results
+
+    nits_body = format_nits_summary(comments)
+    existing = {
+        build_body_signature(nits_body),
+        build_body_signature(test_summary),
+        build_inline_signature("src/app.tsx", 99),
+    }
+
+    inline_posted, nits_posted, test_posted, skipped = _post_review_results(
+        client=mock_client, project_path="org/proj", mr_iid=1,
+        mr_data={"base_sha": "a", "head_sha": "b", "start_sha": "c", "files": []},
+        comments=comments, test_summary=test_summary,
+        diff_lines_map={}, existing=existing,
+    )
+
+    assert (inline_posted, nits_posted, test_posted, skipped) == (0, 0, 0, 2)
+    mock_client.post_mr_comment.assert_not_called()
 
 
 def test_set_ai_updates_config(tmp_path, monkeypatch):

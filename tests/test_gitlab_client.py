@@ -1,4 +1,12 @@
-from sensei.gitlab_client import parse_mr_url, extract_diff_lines
+from types import SimpleNamespace
+
+from sensei.gitlab_client import (
+    GitLabClient,
+    build_body_signature,
+    build_inline_signature,
+    extract_diff_lines,
+    parse_mr_url,
+)
 
 
 def test_parse_mr_url_standard():
@@ -37,3 +45,34 @@ def test_extract_diff_lines():
     assert 11 in lines
     assert 12 in lines
     assert 10 not in lines  # context line, not added
+
+
+def test_get_existing_comments_uses_typed_signatures():
+    client = GitLabClient.__new__(GitLabClient)
+
+    inline_note = {
+        "author": {"username": "sensei"},
+        "body": "Code Review: Fix the nil check.",
+        "position": {"new_path": "src/app.py", "new_line": 14},
+    }
+    general_note = SimpleNamespace(
+        author={"username": "sensei"},
+        body="## Nits\n\n### `src/app.py`\n**L20:** Rename this.",
+    )
+
+    discussions = SimpleNamespace(
+        list=lambda **kwargs: [SimpleNamespace(attributes={"notes": [inline_note]})]
+    )
+    notes = SimpleNamespace(list=lambda **kwargs: [general_note])
+    mr = SimpleNamespace(discussions=discussions, notes=notes)
+    project = SimpleNamespace(mergerequests=SimpleNamespace(get=lambda mr_iid: mr))
+    client.gl = SimpleNamespace(
+        user=SimpleNamespace(username="sensei"),
+        projects=SimpleNamespace(get=lambda project_path: project),
+    )
+
+    signatures = client.get_existing_comments("org/proj", 1)
+
+    assert build_inline_signature("src/app.py", 14) in signatures
+    assert build_body_signature("Code Review: Fix the nil check.") in signatures
+    assert build_body_signature(general_note.body) in signatures

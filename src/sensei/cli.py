@@ -304,6 +304,7 @@ def _post_review_results(
 ) -> tuple:
     """Post review comments to GitLab. Returns (inline_posted, nits_posted, test_posted, skipped)."""
     from sensei.formatter import format_inline_comment, format_nits_summary
+    from sensei.gitlab_client import build_body_signature, build_inline_signature
 
     musts = [c for c in comments if c.get("type") == "must"]
     nits = [c for c in comments if c.get("type") == "nit"]
@@ -316,7 +317,10 @@ def _post_review_results(
             continue
 
         body = format_inline_comment(c)
-        if (c["file"], c["line"]) in existing or body[:100] in existing:
+        file_body = f"**`{c['file']}` L{c['line']}**\n\n{body}"
+        inline_signature = build_inline_signature(c["file"], c["line"])
+        body_signature = build_body_signature(file_body)
+        if inline_signature in existing or body_signature in existing:
             skipped += 1
             continue
 
@@ -334,14 +338,16 @@ def _post_review_results(
                     head_sha=mr_data["head_sha"],
                     start_sha=mr_data["start_sha"],
                 )
+                existing.add(inline_signature)
+                existing.add(build_body_signature(body))
                 inline_posted += 1
                 continue
             except Exception as exc:
                 click.echo(f"  Inline failed for {c['file']}:L{c['line']}, trying as general comment...", err=True)
 
-        file_body = f"**`{c['file']}` L{c['line']}**\n\n{body}"
         try:
             client.post_mr_comment(project_path, mr_iid, file_body)
+            existing.add(body_signature)
             inline_posted += 1
         except Exception as e:
             click.echo(f"  Failed: {c['file']}:L{c['line']}: {e}")
@@ -349,19 +355,29 @@ def _post_review_results(
     nits_posted = 0
     if nits:
         nits_body = format_nits_summary(nits)
-        try:
-            client.post_mr_comment(project_path, mr_iid, nits_body)
-            nits_posted = 1
-        except Exception as e:
-            click.echo(f"  Failed posting nits summary: {e}")
+        nits_signature = build_body_signature(nits_body)
+        if nits_signature in existing:
+            skipped += 1
+        else:
+            try:
+                client.post_mr_comment(project_path, mr_iid, nits_body)
+                existing.add(nits_signature)
+                nits_posted = 1
+            except Exception as e:
+                click.echo(f"  Failed posting nits summary: {e}")
 
     test_posted = 0
     if test_summary:
-        try:
-            client.post_mr_comment(project_path, mr_iid, test_summary)
-            test_posted = 1
-        except Exception as e:
-            click.echo(f"  Failed posting test summary: {e}")
+        test_signature = build_body_signature(test_summary)
+        if test_signature in existing:
+            skipped += 1
+        else:
+            try:
+                client.post_mr_comment(project_path, mr_iid, test_summary)
+                existing.add(test_signature)
+                test_posted = 1
+            except Exception as e:
+                click.echo(f"  Failed posting test summary: {e}")
 
     return (inline_posted, nits_posted, test_posted, skipped)
 
