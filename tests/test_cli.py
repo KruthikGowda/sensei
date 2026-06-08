@@ -280,3 +280,113 @@ def test_apply_ai_overrides_changes_runtime_config():
     assert runtime_config["ai_cli"] == "codex"
     assert runtime_config["model"] == "gpt-5.2"
     assert "_resolved_ai_cli_candidates" not in runtime_config
+
+
+def test_review_merges_cached_artifact_with_fresh_run(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.get_mr_diff.return_value = {
+        "title": "Fix bug",
+        "description": "Fixes issue",
+        "source_branch": "fix-bug",
+        "target_branch": "main",
+        "author": "testuser",
+        "web_url": "https://gitlab.com/org/proj/-/merge_requests/1",
+        "base_sha": "aaa",
+        "head_sha": "bbb",
+        "start_sha": "ccc",
+        "files": [],
+    }
+    monkeypatch.setattr("sensei.gitlab_client.GitLabClient", lambda *args, **kwargs: mock_client)
+    monkeypatch.setattr("sensei.config.load_config", lambda: {"gitlab_url": "https://gitlab.com", "gitlab_pat": "fake", "batch_size": 30})
+    monkeypatch.setattr("sensei.reviewer.load_style_profile", lambda: "")
+    monkeypatch.setattr("sensei.reviewer.load_project_rules", lambda project_path: "")
+    monkeypatch.setattr("sensei.reviewer.load_project_rules_from_repo", lambda client, project_path, ref: "")
+    monkeypatch.setattr("sensei.review_cache.load_review_artifact", lambda *args, **kwargs: {
+        "created_at": "2026-06-08T10:00:00+00:00",
+        "comments": [{"file": "src/old.ts", "line": 10, "type": "must", "body": "Cached comment"}],
+        "test_summary": "Cached tests",
+    })
+    monkeypatch.setattr("sensei.reviewer.review_mr_files", lambda *args, **kwargs: [{"file": "src/new.ts", "line": 20, "type": "must", "body": "Fresh comment"}])
+    monkeypatch.setattr("sensei.review_cache.save_review_artifact", lambda **kwargs: "/tmp/review.json")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["review", "https://gitlab.com/org/proj/-/merge_requests/1"], input="discard\n")
+
+    assert result.exit_code == 0
+    assert "Merging fresh review with cached snapshot from 2026-06-08T10:00:00+00:00" in result.output
+    assert "Recovered 1 cached comment(s) missing from the fresh run." in result.output
+    assert "Cached comment" in result.output
+    assert "Fresh comment" in result.output
+
+
+def test_review_dry_run_saves_review_artifact(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.get_mr_diff.return_value = {
+        "title": "Fix bug",
+        "description": "Fixes issue",
+        "source_branch": "fix-bug",
+        "target_branch": "main",
+        "author": "testuser",
+        "web_url": "https://gitlab.com/org/proj/-/merge_requests/1",
+        "base_sha": "aaa",
+        "head_sha": "bbb",
+        "start_sha": "ccc",
+        "files": [],
+    }
+    monkeypatch.setattr("sensei.gitlab_client.GitLabClient", lambda *args, **kwargs: mock_client)
+    monkeypatch.setattr("sensei.config.load_config", lambda: {"gitlab_url": "https://gitlab.com", "gitlab_pat": "fake", "batch_size": 30})
+    monkeypatch.setattr("sensei.reviewer.load_style_profile", lambda: "")
+    monkeypatch.setattr("sensei.reviewer.load_project_rules", lambda project_path: "")
+    monkeypatch.setattr("sensei.reviewer.load_project_rules_from_repo", lambda client, project_path, ref: "")
+    monkeypatch.setattr("sensei.reviewer.review_mr_files", lambda *args, **kwargs: [{"file": "src/app.ts", "line": 10, "type": "must", "body": "Bug"}])
+    saved = {}
+
+    def fake_save_review_artifact(**kwargs):
+        saved.update(kwargs)
+        return "/tmp/review.json"
+
+    monkeypatch.setattr("sensei.review_cache.load_review_artifact", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sensei.review_cache.save_review_artifact", fake_save_review_artifact)
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["review", "https://gitlab.com/org/proj/-/merge_requests/1", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert saved["mr_url"] == "https://gitlab.com/org/proj/-/merge_requests/1"
+    assert saved["project_path"] == "org/proj"
+
+
+def test_review_fresh_recovers_cached_comments(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.get_mr_diff.return_value = {
+        "title": "Fix bug",
+        "description": "Fixes issue",
+        "source_branch": "fix-bug",
+        "target_branch": "main",
+        "author": "testuser",
+        "web_url": "https://gitlab.com/org/proj/-/merge_requests/1",
+        "base_sha": "aaa",
+        "head_sha": "bbb",
+        "start_sha": "ccc",
+        "files": [],
+    }
+    monkeypatch.setattr("sensei.gitlab_client.GitLabClient", lambda *args, **kwargs: mock_client)
+    monkeypatch.setattr("sensei.config.load_config", lambda: {"gitlab_url": "https://gitlab.com", "gitlab_pat": "fake", "batch_size": 30})
+    monkeypatch.setattr("sensei.reviewer.load_style_profile", lambda: "")
+    monkeypatch.setattr("sensei.reviewer.load_project_rules", lambda project_path: "")
+    monkeypatch.setattr("sensei.reviewer.load_project_rules_from_repo", lambda client, project_path, ref: "")
+    monkeypatch.setattr("sensei.review_cache.load_review_artifact", lambda *args, **kwargs: {
+        "created_at": "2026-06-08T10:00:00+00:00",
+        "comments": [{"file": "src/old.ts", "line": 10, "type": "must", "body": "Cached comment"}],
+        "test_summary": "Cached tests",
+    })
+    monkeypatch.setattr("sensei.reviewer.review_mr_files", lambda *args, **kwargs: [{"file": "src/new.ts", "line": 20, "type": "must", "body": "Fresh comment"}])
+    monkeypatch.setattr("sensei.review_cache.save_review_artifact", lambda **kwargs: "/tmp/review.json")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["review", "https://gitlab.com/org/proj/-/merge_requests/1", "--fresh"], input="discard\n")
+
+    assert result.exit_code == 0
+    assert "Fresh comment" in result.output
+    assert "Cached comment" not in result.output
+    assert "Recovered 1 cached comment(s) missing from the fresh run." not in result.output

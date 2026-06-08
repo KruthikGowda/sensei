@@ -450,14 +450,15 @@ def _handle_approval(client, result: dict, dry_run: bool) -> None:
 @main.command()
 @click.argument("mr_url")
 @click.option("--dry-run", is_flag=True, help="Show review without posting option")
+@click.option("--fresh", is_flag=True, help="Regenerate the review and ignore any saved snapshot merge")
 @click.option("--codex", "ai_cli_override", flag_value="codex", default=None, help="Use Codex for this run")
 @click.option("--claude", "ai_cli_override", flag_value="claude", help="Use Claude for this run")
 @click.option("--auto-ai", "ai_cli_override", flag_value="auto", help="Use auto backend selection for this run")
 @click.option("--model", "model_override", default=None, help="Optional model override for this run")
-def review(mr_url, dry_run, ai_cli_override, model_override):
+def review(mr_url, dry_run, fresh, ai_cli_override, model_override):
     """Review a GitLab Merge Request."""
     from sensei.config import load_config
-    from sensei.gitlab_client import parse_mr_url, validate_mr_url_origin, GitLabClient, extract_diff_lines
+    from sensei.gitlab_client import parse_mr_url, validate_mr_url_origin, GitLabClient
     from sensei.reviewer import (
         review_mr_files,
         consolidate_test_comments,
@@ -465,7 +466,12 @@ def review(mr_url, dry_run, ai_cli_override, model_override):
         load_project_rules,
         load_project_rules_from_repo,
     )
-    from sensei.formatter import format_review, format_for_gitlab, format_inline_comment, format_nits_summary
+    from sensei.formatter import format_review
+    from sensei.review_cache import (
+        load_review_artifact,
+        merge_review_artifacts,
+        save_review_artifact,
+    )
 
     config = load_config()
     config = _apply_ai_overrides(config, ai_cli_override, model_override)
@@ -511,7 +517,8 @@ def review(mr_url, dry_run, ai_cli_override, model_override):
         f"Author: {mr_data['author']}"
     )
 
-    # Review
+    cached_review = load_review_artifact(mr_url, project_path, mr_iid, mr_data)
+
     click.echo(f"Reviewing files with {get_ai_label(config)}...")
     all_comments = review_mr_files(
         files=mr_data["files"],
@@ -523,8 +530,32 @@ def review(mr_url, dry_run, ai_cli_override, model_override):
         batch_size=config.get("batch_size", 30),
     )
 
-    # Consolidate test-gap comments into a single summary
     comments, test_summary = consolidate_test_comments(all_comments)
+    recovered = 0
+    if cached_review and not dry_run and not fresh:
+        click.echo(
+            f"Merging fresh review with cached snapshot from "
+            f"{cached_review['created_at']} for this MR revision."
+        )
+        comments, test_summary, recovered = merge_review_artifacts(
+            comments,
+            test_summary,
+            cached_review,
+        )
+        if recovered:
+            click.echo(
+                f"Recovered {recovered} cached comment(s) missing from the fresh run."
+            )
+
+    cache_path = save_review_artifact(
+        mr_url=mr_url,
+        project_path=project_path,
+        mr_iid=mr_iid,
+        mr_data=mr_data,
+        comments=comments,
+        test_summary=test_summary,
+    )
+    click.echo(f"Saved review snapshot to {cache_path}")
 
     # Display
     click.echo("\n" + "=" * 60)
@@ -534,104 +565,18 @@ def review(mr_url, dry_run, ai_cli_override, model_override):
     if (not comments and not test_summary) or dry_run:
         return
 
-    # Approval flow
-    action = click.prompt(
-        "\nAction", type=click.Choice(["approve", "edit", "discard"]), default="discard"
+    _handle_approval(
+        client=client,
+        result={
+            "mr_url": mr_url,
+            "project_path": project_path,
+            "mr_iid": mr_iid,
+            "mr_data": mr_data,
+            "comments": comments,
+            "test_summary": test_summary,
+        },
+        dry_run=dry_run,
     )
-
-    if action == "approve":
-        click.echo("Checking for existing comments...")
-        existing = client.get_existing_comments(project_path, mr_iid)
-
-        # Build diff line sets per file for validation
-        diff_lines_map = {}
-        for f in mr_data["files"]:
-            if f["diff"]:
-                diff_lines_map[f["new_path"]] = extract_diff_lines(f["diff"])
-
-        # Split comments into must-fix and nits
-        musts = [c for c in comments if c.get("type") == "must"]
-        nits = [c for c in comments if c.get("type") == "nit"]
-
-        click.echo("Posting comments to GitLab...")
-        inline_posted = 0
-        skipped = 0
-
-        # Post must-fix comments as inline
-        for c in musts:
-            if c["line"] == 0:
-                continue
-
-            body = format_inline_comment(c)
-            if (c["file"], c["line"]) in existing or body[:100] in existing:
-                skipped += 1
-                continue
-
-            valid_lines = diff_lines_map.get(c["file"], set())
-
-            if c["line"] in valid_lines:
-                try:
-                    client.post_inline_comment(
-                        project_path=project_path,
-                        mr_iid=mr_iid,
-                        file_path=c["file"],
-                        new_line=c["line"],
-                        body=body,
-                        base_sha=mr_data["base_sha"],
-                        head_sha=mr_data["head_sha"],
-                        start_sha=mr_data["start_sha"],
-                    )
-                    inline_posted += 1
-                    continue
-                except Exception as exc:
-                    click.echo(f"  Inline failed for {c['file']}:L{c['line']}, trying as general comment...", err=True)
-
-            # Line not in diff or inline failed — post as general comment
-            file_body = f"**`{c['file']}` L{c['line']}**\n\n{body}"
-            try:
-                client.post_mr_comment(project_path, mr_iid, file_body)
-                inline_posted += 1
-            except Exception as e:
-                click.echo(f"  Failed: {c['file']}:L{c['line']}: {e}")
-
-        # Post all nits as one summary comment
-        nits_posted = 0
-        if nits:
-            nits_body = format_nits_summary(nits)
-            try:
-                client.post_mr_comment(project_path, mr_iid, nits_body)
-                nits_posted = 1
-            except Exception as e:
-                click.echo(f"  Failed posting nits summary: {e}")
-
-        # Post test coverage summary as one comment
-        test_posted = 0
-        if test_summary:
-            try:
-                client.post_mr_comment(project_path, mr_iid, test_summary)
-                test_posted = 1
-            except Exception as e:
-                click.echo(f"  Failed posting test summary: {e}")
-
-        parts = [f"{inline_posted} must-fix inline"]
-        if nits_posted:
-            parts.append(f"{nits_posted} nits summary")
-        if test_posted:
-            parts.append(f"{test_posted} test coverage summary")
-        if skipped:
-            parts.append(f"{skipped} skipped")
-        click.echo(f"Posted {' + '.join(parts)}")
-    elif action == "edit":
-        import os
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as tmp:
-            tmp.write(format_for_gitlab(comments))
-            tmp_path = tmp.name
-        os.chmod(tmp_path, 0o600)
-        click.echo(f"Review saved to {tmp_path} — edit it, then run:")
-        click.echo(f"  sensei post {mr_url} {tmp_path}")
-    else:
-        click.echo("Review discarded.")
 
 
 @main.command()
