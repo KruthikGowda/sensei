@@ -16,6 +16,8 @@ def test_build_file_review_prompt_includes_diff():
     assert "type hints" in prompt
     assert "Code Review:" in prompt  # example format
     assert '"type"' in prompt  # new type field in output format
+    assert "AGENTS/CODEX/CLAUDE" in prompt
+    assert "required plan updates" in prompt
     assert "Setu components" in prompt
     assert "existing chart wrappers" in prompt
 
@@ -222,6 +224,23 @@ def test_load_project_rules_from_repo_includes_agents_md():
     result = load_project_rules_from_repo(FakeClient(), "fake/project", "main")
     assert "# From AGENTS.md" in result
     assert "Use Optional from typing." in result
+
+
+def test_load_project_rules_from_repo_includes_plan_and_agent_rule_files():
+    contents = {
+        "PLANS.md": "Keep implementation plan in sync with behavior changes.",
+        ".agents/rules.md": "Agents must preserve reviewer ownership boundaries.",
+    }
+
+    class FakeClient:
+        def get_file_content(self, project_path, rule_file, ref):
+            return contents.get(rule_file, "")
+
+    result = load_project_rules_from_repo(FakeClient(), "fake/project", "main")
+    assert "# From PLANS.md" in result
+    assert "Keep implementation plan in sync" in result
+    assert "# From .agents/rules.md" in result
+    assert "preserve reviewer ownership boundaries" in result
 
 
 def test_review_file_preserves_comment_types_for_any_provider(monkeypatch):

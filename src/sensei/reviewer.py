@@ -60,6 +60,8 @@ def build_file_review_prompt(
 - Naming inconsistencies, missing conventions
 - Security issues, environment misconfigs
 - Architecture violations (cross-layer leakage, duplication across packages)
+- Agent-instruction violations: changes that ignore repo guidance from AGENTS/CODEX/CLAUDE
+  files, skip required plan updates, or break documented agent workflows and ownership
 - Reinvented UI primitives: custom components, bespoke CSS class systems, or ad-hoc charts
   when the diff should reuse existing shared patterns such as Setu components, established
   classnames/utilities, or existing chart wrappers
@@ -543,9 +545,14 @@ def load_project_rules_from_repo(client, project_path: str, ref: str) -> str:
     rules = []
     rule_files = [
         "AGENTS.md",
+        "PLANS.md",
+        "PLAN.md",
         "CLAUDE.md",
         "CODEX.md",
         ".claude/rules.md",
+        ".codex/rules.md",
+        ".agents/rules.md",
+        ".agents/README.md",
         "CODING_PRINCIPLES.md",
     ]
 
