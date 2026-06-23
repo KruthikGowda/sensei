@@ -282,6 +282,154 @@ def test_apply_ai_overrides_changes_runtime_config():
     assert "_resolved_ai_cli_candidates" not in runtime_config
 
 
+def test_build_mr_title_comments_flags_missing_ticket():
+    from sensei.cli import build_mr_title_comments
+
+    comments = build_mr_title_comments({"title": "fix: harden shared axios base URL handling"})
+
+    assert len(comments) == 1
+    assert comments[0]["type"] == "nit"
+    assert "type(JIRA-ID): Title" in comments[0]["body"]
+    assert "fix: harden shared axios base URL handling" in comments[0]["body"]
+
+
+def test_build_mr_title_comments_allows_standard_title():
+    from sensei.cli import build_mr_title_comments
+
+    comments = build_mr_title_comments({"title": "fix(BRIDGE-2254): Harden axios base URL handling"})
+
+    assert comments == []
+
+
+def test_build_mr_description_comments_flags_placeholder_description():
+    from sensei.cli import build_mr_description_comments
+
+    comments = build_mr_description_comments({
+        "description": (
+            "## Description\n<!-- Provide a brief description -->\n"
+            "## Preview URL\n<!-- Provide a preview URL -->\n"
+            "## Screenshots\n<!-- Include screenshots or GIFs that demonstrate the changes -->\n"
+        ),
+    })
+
+    assert len(comments) == 4
+    bodies = "\n".join(comment["body"] for comment in comments)
+    assert "description still looks incomplete" in bodies
+    assert "Jira ticket id" in bodies
+    assert "preview URL" in bodies
+    assert "screenshots or screen recordings" in bodies
+
+
+def test_build_mr_description_comments_flags_missing_jira_ticket():
+    from sensei.cli import build_mr_description_comments
+
+    comments = build_mr_description_comments({
+        "description": (
+            "## Description\n"
+            "Adds the incoming invoice table and wires the status filters for the reviewer flow.\n"
+            "## Preview URL\n"
+            "Preview: https://preview.example.com/invoices\n"
+            "## Screenshots\n"
+            "![invoice table](https://preview.example.com/invoices.png)"
+        ),
+    })
+
+    assert len(comments) == 1
+    assert "Jira ticket id" in comments[0]["body"]
+
+
+def test_build_mr_description_comments_flags_missing_preview_url():
+    from sensei.cli import build_mr_description_comments
+
+    comments = build_mr_description_comments({
+        "description": (
+            "## Description\n"
+            "BRIDGE-2254 adds the incoming invoice table and wires status filters for reviewers.\n"
+            "## Screenshots\n"
+            "![invoice table](https://preview.example.com/invoices.png)"
+        ),
+    })
+
+    assert len(comments) == 1
+    assert "preview URL" in comments[0]["body"]
+
+
+def test_build_mr_description_comments_flags_missing_screenshot():
+    from sensei.cli import build_mr_description_comments
+
+    comments = build_mr_description_comments({
+        "description": (
+            "## Description\n"
+            "BRIDGE-2254 adds the incoming invoice table and wires status filters for reviewers.\n"
+            "## Preview URL\n"
+            "Preview: https://preview.example.com/invoices"
+        ),
+    })
+
+    assert len(comments) == 1
+    assert "screenshots or screen recordings" in comments[0]["body"]
+
+
+def test_build_mr_description_comments_allows_complete_description():
+    from sensei.cli import build_mr_description_comments
+
+    comments = build_mr_description_comments({
+        "description": (
+            "## Description\n"
+            "BRIDGE-2254 adds the incoming invoice table and wires status filters for reviewers.\n"
+            "## Preview URL\n"
+            "Preview: https://preview.example.com/invoices\n"
+            "## Screenshots\n"
+            "![invoice table](/uploads/invoices.png)"
+        ),
+    })
+
+    assert comments == []
+
+
+def test_build_metadata_comments_combines_title_and_description_rules():
+    from sensei.cli import build_metadata_comments
+
+    comments = build_metadata_comments({
+        "source_branch": "fix/auth-retry",
+        "title": "Fix auth retry",
+        "description": (
+            "## Description\n"
+            "BRIDGE-2254 adds the incoming invoice table and wires status filters for reviewers.\n"
+            "## Preview URL\n"
+            "Preview: https://preview.example.com/invoices\n"
+            "## Screenshots\n"
+            "![invoice table](/uploads/invoices.png)"
+        ),
+    })
+
+    assert len(comments) == 1
+    assert "type(JIRA-ID): Title" in comments[0]["body"]
+
+
+def test_drop_deprecated_metadata_comments_removes_codex_branch_rule():
+    from sensei.cli import _drop_deprecated_metadata_comments
+
+    comments = [
+        {
+            "file": "Merge request metadata",
+            "line": 0,
+            "type": "nit",
+            "body": "Code Review: Source branch `feat/foo` does not use the `codex/` prefix.",
+        },
+        {
+            "file": "Merge request metadata",
+            "line": 0,
+            "type": "nit",
+            "body": "Code Review: MR title does not follow the expected format.",
+        },
+    ]
+
+    filtered = _drop_deprecated_metadata_comments(comments)
+
+    assert filtered == [comments[1]]
+
+
 def test_review_merges_cached_artifact_with_fresh_run(monkeypatch):
     mock_client = MagicMock()
     mock_client.get_mr_diff.return_value = {

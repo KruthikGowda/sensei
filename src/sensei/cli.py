@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 from typing import Callable, Optional
 import click
 from sensei.llm_cli import (
@@ -6,6 +7,37 @@ from sensei.llm_cli import (
     get_ai_cli_status,
     get_ai_label,
     resolve_ai_cli_candidates,
+)
+
+ALLOWED_MR_TITLE_TYPES = (
+    "build",
+    "chore",
+    "ci",
+    "docs",
+    "feat",
+    "fix",
+    "hotfix",
+    "perf",
+    "refact",
+    "refactor",
+    "style",
+    "test",
+)
+MR_TITLE_PATTERN = re.compile(
+    rf"^({'|'.join(ALLOWED_MR_TITLE_TYPES)})\([A-Z][A-Z0-9]+-\d+\):\s+\S.+$"
+)
+JIRA_TICKET_PATTERN = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+URL_PATTERN = re.compile(r"https?://[^\s)>]+")
+SCREENSHOT_PATTERN = re.compile(
+    r"!\[[^\]]*\]\([^)]+\)|/uploads/[^)\s]+|https?://[^\s)>]+\.(?:png|jpe?g|gif|webp|mp4|mov)",
+    re.IGNORECASE,
+)
+SECTION_HEADER_PATTERN = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+DESCRIPTION_PLACEHOLDERS = (
+    "<!-- provide a brief description",
+    "<!-- provide a preview url",
+    "<!-- list the changes",
+    "<!-- include screenshots",
 )
 
 
@@ -27,6 +59,177 @@ def _apply_ai_overrides(
     if model_override is not None:
         runtime_config["model"] = model_override
     return runtime_config
+
+
+def build_mr_title_comments(mr_data: dict) -> list:
+    """Generate metadata review comments for MR title conventions."""
+    title = mr_data.get("title", "")
+    if not title or MR_TITLE_PATTERN.match(title):
+        return []
+
+    allowed_types = ", ".join(ALLOWED_MR_TITLE_TYPES)
+    return [
+        {
+            "file": "Merge request metadata",
+            "line": 0,
+            "confidence": 82,
+            "type": "nit",
+            "body": (
+                "Code Review: MR title does not follow the expected "
+                "`type(JIRA-ID): Title` format.\n\n"
+                f"- Current title: `{title}`\n"
+                f"- Expected examples: `fix(BRIDGE-1234): Handle token refresh` or "
+                "`feat(BRIDGE-1234): Add refund validation`\n"
+                f"- Allowed types: `{allowed_types}`\n\n"
+                "Suggestion: Rename the MR so the change type, JIRA ticket, and human-readable title "
+                "are all present in the title."
+            ),
+        }
+    ]
+
+
+def _get_markdown_section(description: str, section_name: str) -> str:
+    """Return the content under a second-level markdown heading."""
+    matches = list(SECTION_HEADER_PATTERN.finditer(description))
+    for index, match in enumerate(matches):
+        if match.group(1).strip().lower() != section_name.lower():
+            continue
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(description)
+        return description[start:end].strip()
+    return ""
+
+
+def _remove_template_lines(text: str) -> list:
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+        and not line.strip().startswith("<span")
+        and not line.strip().startswith("<!--")
+        and not line.strip().startswith("##")
+    ]
+
+
+def _description_has_real_content(description: str) -> bool:
+    description_section = _get_markdown_section(description, "Description") or description
+    stripped_lines = [
+        line
+        for line in _remove_template_lines(description_section)
+        if not line.startswith("- [ ]")
+    ]
+    return any(len(line) >= 20 for line in stripped_lines)
+
+
+def _section_has_url(description: str, section_name: str) -> bool:
+    section = _get_markdown_section(description, section_name)
+    return bool(section and URL_PATTERN.search(section))
+
+
+def _section_has_visual_evidence(description: str, section_name: str) -> bool:
+    section = _get_markdown_section(description, section_name)
+    if not section:
+        return False
+    if SCREENSHOT_PATTERN.search(section):
+        return True
+    return bool(URL_PATTERN.search(section) and _remove_template_lines(section))
+
+
+def _drop_deprecated_metadata_comments(comments: list) -> list:
+    """Remove stale metadata comments from older cached reviews."""
+    deprecated_phrases = (
+        "does not use the `codex/` prefix",
+        "should use the `codex/` prefix",
+        "Rename Codex-generated branches",
+    )
+    return [
+        comment
+        for comment in comments
+        if not (
+            comment.get("file") == "Merge request metadata"
+            and any(phrase in comment.get("body", "") for phrase in deprecated_phrases)
+        )
+    ]
+
+
+def build_mr_description_comments(mr_data: dict) -> list:
+    """Generate metadata review comments for MR description conventions."""
+    description = mr_data.get("description", "") or ""
+    normalized_description = description.lower()
+    comments = []
+
+    if not _description_has_real_content(description) or any(
+        placeholder in normalized_description for placeholder in DESCRIPTION_PLACEHOLDERS
+    ):
+        comments.append(
+            {
+                "file": "Merge request metadata",
+                "line": 0,
+                "confidence": 82,
+                "type": "nit",
+                "body": (
+                    "Code Review: MR description still looks incomplete.\n\n"
+                    "- The description should explain what changed and why, not leave template placeholders behind.\n"
+                    "- Reviewers need enough context to understand the behavior without reconstructing it from the diff.\n\n"
+                    "Suggestion: Fill in the Description and Changes Made sections with the actual scope of this MR."
+                ),
+            }
+        )
+
+    if not JIRA_TICKET_PATTERN.search(description):
+        comments.append(
+            {
+                "file": "Merge request metadata",
+                "line": 0,
+                "confidence": 82,
+                "type": "nit",
+                "body": (
+                    "Code Review: MR description does not include a Jira ticket id.\n\n"
+                    "- The MR needs Jira traceability in the body, not only in follow-up comments.\n"
+                    "- This also helps QA and release tracking connect the code change back to the product request.\n\n"
+                    "Suggestion: Add the relevant ticket id, for example `BRIDGE-1234`, to the MR description."
+                ),
+            }
+        )
+
+    if not _section_has_url(description, "Preview URL"):
+        comments.append(
+            {
+                "file": "Merge request metadata",
+                "line": 0,
+                "confidence": 82,
+                "type": "nit",
+                "body": (
+                    "Code Review: MR description is missing a preview URL.\n\n"
+                    "- UI-facing changes should include a preview link so reviewers can exercise the flow quickly.\n"
+                    "- The current Preview URL section still appears empty or placeholder-only.\n\n"
+                    "Suggestion: Add the deployed preview URL to the MR description before requesting review."
+                ),
+            }
+        )
+
+    if not _section_has_visual_evidence(description, "Screenshots"):
+        comments.append(
+            {
+                "file": "Merge request metadata",
+                "line": 0,
+                "confidence": 82,
+                "type": "nit",
+                "body": (
+                    "Code Review: MR description is missing screenshots or screen recordings.\n\n"
+                    "- This is a UI change, so reviewers need visual evidence of the new state and important edge states.\n"
+                    "- Without screenshots, review has to rely entirely on local checkout or guesswork.\n\n"
+                    "Suggestion: Attach screenshots or a short recording for the changed screens."
+                ),
+            }
+        )
+
+    return comments
+
+
+def build_metadata_comments(mr_data: dict) -> list:
+    """Generate deterministic review comments from MR metadata."""
+    return build_mr_title_comments(mr_data) + build_mr_description_comments(mr_data)
 
 
 @main.command()
@@ -278,6 +481,8 @@ def _review_single_mr(
         )
 
         comments, test_summary = consolidate_test_comments(all_comments)
+        comments.extend(build_metadata_comments(mr_data))
+        comments = _drop_deprecated_metadata_comments(comments)
         result["comments"] = comments
         result["test_summary"] = test_summary
 
@@ -531,6 +736,8 @@ def review(mr_url, dry_run, fresh, ai_cli_override, model_override):
     )
 
     comments, test_summary = consolidate_test_comments(all_comments)
+    comments.extend(build_metadata_comments(mr_data))
+    comments = _drop_deprecated_metadata_comments(comments)
     recovered = 0
     if cached_review and not dry_run and not fresh:
         click.echo(
@@ -542,6 +749,7 @@ def review(mr_url, dry_run, fresh, ai_cli_override, model_override):
             test_summary,
             cached_review,
         )
+        comments = _drop_deprecated_metadata_comments(comments)
         if recovered:
             click.echo(
                 f"Recovered {recovered} cached comment(s) missing from the fresh run."
