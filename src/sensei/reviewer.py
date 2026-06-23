@@ -60,6 +60,9 @@ def build_file_review_prompt(
 - Naming inconsistencies, missing conventions
 - Security issues, environment misconfigs
 - Architecture violations (cross-layer leakage, duplication across packages)
+- Reinvented UI primitives: custom components, bespoke CSS class systems, or ad-hoc charts
+  when the diff should reuse existing shared patterns such as Setu components, established
+  classnames/utilities, or existing chart wrappers
 
 ## Test coverage gaps
 If the diff adds or changes logic that has no corresponding test, emit a SEPARATE entry with `"type": "test"`. Do NOT write a full comment — just state what needs testing in one line.

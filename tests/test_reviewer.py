@@ -16,6 +16,8 @@ def test_build_file_review_prompt_includes_diff():
     assert "type hints" in prompt
     assert "Code Review:" in prompt  # example format
     assert '"type"' in prompt  # new type field in output format
+    assert "Setu components" in prompt
+    assert "existing chart wrappers" in prompt
 
 
 def test_build_file_review_prompt_uses_diff_only_for_lockfiles():
