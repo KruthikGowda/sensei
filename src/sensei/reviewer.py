@@ -3,6 +3,21 @@ import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sensei.config import CONFIG_DIR
+from sensei.llm_cli import REVIEW_OUTPUT_SCHEMA, run_prompt
+
+GENERATED_REVIEW_BASENAMES = {
+    "bun.lock",
+    "bun.lockb",
+    "cargo.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+}
+GENERATED_REVIEW_SUFFIXES = (".min.css", ".min.js", ".snap")
+LARGE_FILE_CONTEXT_THRESHOLD = 16000
+MAX_CONTEXT_WINDOWS = 4
+CONTEXT_WINDOW_PADDING = 20
+REVIEW_REASONING_EFFORT = "low"
 
 
 def build_file_review_prompt(
@@ -13,6 +28,9 @@ def build_file_review_prompt(
     project_rules: str,
     mr_context: str,
 ) -> str:
+    file_context_heading, file_context_body = _build_file_context(
+        file_path, diff, file_content
+    )
     return f"""You are a thoughtful senior engineer reviewing a teammate's code. Write like a human — direct, specific, helpful. No corporate tone, no robotic structure, no filler.
 
 ## Your Review Style
@@ -26,9 +44,9 @@ def build_file_review_prompt(
 
 ## File: {file_path}
 
-### Full file content (for context):
+### {file_context_heading}
 ```
-{file_content}
+{file_context_body}
 ```
 
 ### Diff (review these changes):
@@ -42,6 +60,11 @@ def build_file_review_prompt(
 - Naming inconsistencies, missing conventions
 - Security issues, environment misconfigs
 - Architecture violations (cross-layer leakage, duplication across packages)
+- Agent-instruction violations: changes that ignore repo guidance from AGENTS/CODEX/CLAUDE
+  files, skip required plan updates, or break documented agent workflows and ownership
+- Reinvented UI primitives: custom components, bespoke CSS class systems, or ad-hoc charts
+  when the diff should reuse existing shared patterns such as Setu components, established
+  classnames/utilities, or existing chart wrappers
 
 ## Test coverage gaps
 If the diff adds or changes logic that has no corresponding test, emit a SEPARATE entry with `"type": "test"`. Do NOT write a full comment — just state what needs testing in one line.
@@ -86,6 +109,9 @@ def build_silent_failure_prompt(
     file_content: str,
     project_rules: str,
 ) -> str:
+    file_context_heading, file_context_body = _build_file_context(
+        file_path, diff, file_content
+    )
     return f"""You are reviewing error handling in a teammate's code. Look for places where errors are silently swallowed, users get no feedback, or fallbacks mask real problems.
 
 ## Project Rules
@@ -93,9 +119,9 @@ def build_silent_failure_prompt(
 
 ## File: {file_path}
 
-### Full file content:
+### {file_context_heading}
 ```
-{file_content}
+{file_context_body}
 ```
 
 ### Diff (focus on these changes):
@@ -134,20 +160,109 @@ If no issues found, return: []
 Return ONLY the JSON array."""
 
 
+def _build_file_context(file_path: str, diff: str, file_content: str) -> tuple:
+    if _is_generated_or_lockfile(file_path):
+        return (
+            "File context (generated file omitted to keep review fast)",
+            "Generated file detected. Review the diff directly and only call out confident issues "
+            "that are visible from the changed entries.",
+        )
+
+    if len(file_content) <= LARGE_FILE_CONTEXT_THRESHOLD:
+        return ("Full file content (for context):", file_content)
+
+    focused_context = _extract_relevant_file_context(file_content, diff)
+    return (
+        "Relevant file context near changed lines (truncated for speed):",
+        focused_context,
+    )
+
+
+def _is_generated_or_lockfile(file_path: str) -> bool:
+    normalized = file_path.lower()
+    basename = normalized.rsplit("/", 1)[-1]
+    return basename in GENERATED_REVIEW_BASENAMES or basename.endswith(
+        GENERATED_REVIEW_SUFFIXES
+    )
+
+
+def _extract_relevant_file_context(file_content: str, diff: str) -> str:
+    lines = file_content.splitlines()
+    if not lines:
+        return file_content
+
+    ranges = _extract_changed_line_ranges(diff)
+    if not ranges:
+        return _truncate_file_content(file_content)
+
+    windows = []
+    for start, count in ranges[:MAX_CONTEXT_WINDOWS]:
+        if count <= 0:
+            count = 1
+        window_start = max(start - CONTEXT_WINDOW_PADDING, 1)
+        window_end = min(start + count + CONTEXT_WINDOW_PADDING - 1, len(lines))
+        windows.append((window_start, window_end))
+
+    merged_windows = []
+    for start, end in sorted(windows):
+        if not merged_windows or start > merged_windows[-1][1] + 1:
+            merged_windows.append([start, end])
+        else:
+            merged_windows[-1][1] = max(merged_windows[-1][1], end)
+
+    sections = []
+    for start, end in merged_windows[:MAX_CONTEXT_WINDOWS]:
+        chunk = "\n".join(lines[start - 1 : end])
+        sections.append(f"# Lines {start}-{end}\n{chunk}")
+
+    if not sections:
+        return _truncate_file_content(file_content)
+
+    return "\n\n...\n\n".join(sections)
+
+
+def _extract_changed_line_ranges(diff: str) -> list:
+    ranges = []
+    for match in re.finditer(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", diff, re.MULTILINE):
+        start = int(match.group(1))
+        count = int(match.group(2) or "1")
+        ranges.append((start, count))
+    return ranges
+
+
+def _truncate_file_content(file_content: str, limit: int = LARGE_FILE_CONTEXT_THRESHOLD) -> str:
+    if len(file_content) <= limit:
+        return file_content
+    head = file_content[: limit // 2].rstrip()
+    tail = file_content[-(limit // 2) :].lstrip()
+    return (
+        f"{head}\n\n...\n\n"
+        f"[truncated {len(file_content) - limit} characters to keep review fast]\n\n"
+        f"{tail}"
+    )
+
+
 def parse_json_review(raw: str, file_path: str) -> list:
     """Parse JSON review output into structured comments."""
     raw = raw.strip()
 
-    # Try to extract JSON array from the response
-    # Sometimes Claude wraps it in markdown code blocks
-    json_match = re.search(r'\[.*\]', raw, re.DOTALL)
-    if not json_match:
-        return []
-
     try:
-        items = json.loads(json_match.group())
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return []
+        # Try to extract JSON array from the response
+        # Sometimes the model wraps it in markdown code blocks
+        json_match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if not json_match:
+            return []
+        try:
+            parsed = json.loads(json_match.group())
+        except json.JSONDecodeError:
+            return []
+
+    if isinstance(parsed, dict) and isinstance(parsed.get("comments"), list):
+        items = parsed["comments"]
+    else:
+        items = parsed
 
     comments = []
     for item in items:
@@ -244,44 +359,48 @@ def review_file(
     style_profile: str,
     project_rules: str,
     mr_context: str,
+    ai_config: dict,
 ) -> list:
-    """Review a single file using claude CLI with superpowers methodology."""
+    """Review a single file using the configured AI CLI."""
     # Phase 1: Main code review
     prompt = build_file_review_prompt(
         file_path, diff, file_content, style_profile, project_rules, mr_context
     )
-    result = subprocess.run(
-        ["claude", "-p", "--output-format", "text"],
-        input=prompt,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if result.returncode != 0:
+    try:
+        raw_review = run_prompt(
+            prompt,
+            timeout=180,
+            config=ai_config,
+            schema=REVIEW_OUTPUT_SCHEMA,
+            reasoning_effort=REVIEW_REASONING_EFFORT,
+        )
+    except RuntimeError as exc:
         return [{"file": file_path, "line": 0, "confidence": 100, "type": "must",
-                 "body": f"Review failed for this file (exit code {result.returncode})."}]
+                 "body": f"Review failed for this file. {exc}"}]
 
-    comments = parse_json_review(result.stdout, file_path)
+    comments = parse_json_review(raw_review, file_path)
 
     # Phase 2: Silent failure hunting (only if diff has error handling patterns)
     if _has_error_handling(diff):
         sf_prompt = build_silent_failure_prompt(
             file_path, diff, file_content, project_rules
         )
-        sf_result = subprocess.run(
-            ["claude", "-p", "--output-format", "text"],
-            input=sf_prompt,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        if sf_result.returncode == 0:
-            sf_comments = parse_json_review(sf_result.stdout, file_path)
+        try:
+            sf_raw_review = run_prompt(
+                sf_prompt,
+                timeout=180,
+                config=ai_config,
+                schema=REVIEW_OUTPUT_SCHEMA,
+                reasoning_effort=REVIEW_REASONING_EFFORT,
+            )
+            sf_comments = parse_json_review(sf_raw_review, file_path)
             # Deduplicate by line number
             existing_lines = {c["line"] for c in comments}
             for c in sf_comments:
                 if c["line"] not in existing_lines:
                     comments.append(c)
+        except RuntimeError:
+            pass
 
     return comments
 
@@ -292,6 +411,7 @@ def review_mr_files(
     style_profile: str,
     project_rules: str,
     mr_context: str,
+    ai_config: dict,
     batch_size: int = 30,
 ) -> list:
     """Review all MR files in parallel batches."""
@@ -316,6 +436,7 @@ def review_mr_files(
                     style_profile=style_profile,
                     project_rules=project_rules,
                     mr_context=mr_context,
+                    ai_config=ai_config,
                 )
                 futures[future] = path
 
@@ -417,12 +538,23 @@ def load_project_rules(project_path: str) -> str:
 
 
 def load_project_rules_from_repo(client, project_path: str, ref: str) -> str:
-    """Fetch CLAUDE.md and other rule files from the repo."""
+    """Fetch AI instruction files from the repo."""
     if client is None:
         return ""
 
     rules = []
-    rule_files = ["CLAUDE.md", ".claude/rules.md", "CODING_PRINCIPLES.md"]
+    rule_files = [
+        "AGENTS.md",
+        "PLANS.md",
+        "PLAN.md",
+        "CLAUDE.md",
+        "CODEX.md",
+        ".claude/rules.md",
+        ".codex/rules.md",
+        ".agents/rules.md",
+        ".agents/README.md",
+        "CODING_PRINCIPLES.md",
+    ]
 
     for rule_file in rule_files:
         content = client.get_file_content(project_path, rule_file, ref)

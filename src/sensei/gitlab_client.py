@@ -3,6 +3,21 @@ from urllib.parse import urlparse
 import gitlab
 
 
+def normalize_comment_body(body: str) -> str:
+    """Normalize comment text so duplicate checks ignore whitespace-only drift."""
+    return re.sub(r"\s+", " ", body or "").strip()
+
+
+def build_body_signature(body: str) -> tuple:
+    """Create a stable signature for a general comment body."""
+    return ("body", normalize_comment_body(body))
+
+
+def build_inline_signature(file_path: str, line_number: int) -> tuple:
+    """Create a stable signature for an inline comment location."""
+    return ("inline", file_path, line_number)
+
+
 def extract_diff_lines(diff: str) -> set:
     """Extract new-side line numbers that are part of the diff."""
     lines = set()
@@ -99,8 +114,8 @@ class GitLabClient:
 
     def get_existing_comments(self, project_path: str, mr_iid: int) -> set:
         """Fetch existing comment signatures to avoid duplicates.
-        Returns a set of (file_path, line_number) tuples for inline comments
-        and body hashes for general comments posted by the current user.
+        Returns a set of typed signatures for inline locations and comment bodies
+        posted by the current user.
         """
         project = self.gl.projects.get(project_path)
         mr = project.mergerequests.get(mr_iid)
@@ -115,15 +130,16 @@ class GitLabClient:
                 body = note.get("body", "")
                 pos = note.get("position")
                 if pos and pos.get("new_path") and pos.get("new_line"):
-                    signatures.add((pos["new_path"], pos["new_line"]))
-                # Also track general comments by first 100 chars
-                signatures.add(body[:100])
+                    signatures.add(
+                        build_inline_signature(pos["new_path"], pos["new_line"])
+                    )
+                signatures.add(build_body_signature(body))
 
         # Check notes (general comments)
         for note in mr.notes.list(per_page=100, iterator=True):
             if note.author.get("username") != current_user:
                 continue
-            signatures.add(note.body[:100])
+            signatures.add(build_body_signature(note.body))
 
         return signatures
 
