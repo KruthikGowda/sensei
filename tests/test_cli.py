@@ -78,7 +78,9 @@ def test_review_batch_no_urls():
 
 def test_review_batch_rejects_invalid_urls():
     runner = CliRunner()
-    result = runner.invoke(main, ["review-batch", "not-a-url"])
+    fake_config = {"gitlab_url": "https://gitlab.com", "gitlab_pat": "test-token"}
+    with patch("sensei.config.load_config", return_value=fake_config):
+        result = runner.invoke(main, ["review-batch", "not-a-url"])
     assert result.exit_code != 0
     assert "Invalid" in result.output
 

@@ -129,6 +129,7 @@ def test_run_prompt_passes_reasoning_effort_to_codex(monkeypatch):
 
         return Result()
 
+    monkeypatch.setattr("sensei.llm_cli.resolve_ai_cli", lambda config=None: "codex")
     monkeypatch.setattr("sensei.llm_cli.subprocess.run", fake_run)
 
     output = run_prompt(
