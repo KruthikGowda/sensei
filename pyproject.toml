@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sensei-review"
-version = "0.1.0"
+version = "0.2.0"
 description = "AI-powered code review CLI for GitLab MRs — learns your style, reviews like you."
 readme = "README.md"
 license = {text = "MIT"}
