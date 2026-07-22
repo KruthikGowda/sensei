@@ -24,6 +24,7 @@ def test_review_command_exists():
     assert result.exit_code == 0
     assert "--codex" in result.output
     assert "--claude" in result.output
+    assert "GitHub pull request" in result.output
 
 
 from unittest.mock import patch, MagicMock
@@ -36,6 +37,7 @@ def test_review_batch_command_exists():
     assert "concurrency" in result.output
     assert "dry-run" in result.output
     assert "--file" in result.output
+    assert "GitHub PRs" in result.output
 
 
 def test_set_ai_command_exists():
@@ -246,6 +248,15 @@ def test_doctor_reports_backend_status(tmp_path, monkeypatch):
             "path": f"/tmp/{provider}",
         },
     )
+    monkeypatch.setattr(
+        "sensei.cli._get_github_cli_status",
+        lambda: {
+            "installed": True,
+            "authenticated": True,
+            "detail": "Authenticated",
+            "path": "/tmp/gh",
+        },
+    )
 
     runner = CliRunner()
     result = runner.invoke(main, ["doctor"])
@@ -253,6 +264,7 @@ def test_doctor_reports_backend_status(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "Resolved order: codex, claude" in result.output
     assert "Codex: installed=yes, authenticated=yes" in result.output
+    assert "GitHub CLI: installed=yes, authenticated=yes" in result.output
 
 
 def test_use_command_updates_config(tmp_path, monkeypatch):
@@ -540,3 +552,53 @@ def test_review_fresh_recovers_cached_comments(monkeypatch):
     assert "Fresh comment" in result.output
     assert "Cached comment" not in result.output
     assert "Recovered 1 cached comment(s) missing from the fresh run." not in result.output
+
+
+def test_review_supports_github_pr_urls(monkeypatch):
+    mock_client = MagicMock()
+    mock_client.get_mr_diff.return_value = {
+        "title": "Add component",
+        "description": "Adds a new component",
+        "source_branch": "feature/pr",
+        "target_branch": "main",
+        "author": "octocat",
+        "web_url": "https://github.com/org/proj/pull/7",
+        "base_sha": "aaa",
+        "head_sha": "bbb",
+        "start_sha": "ccc",
+        "files": [],
+    }
+    monkeypatch.setattr("sensei.github_client.GitHubClient", lambda *args, **kwargs: mock_client)
+    monkeypatch.setattr("sensei.config.load_config", lambda: {"batch_size": 30})
+    monkeypatch.setattr("sensei.reviewer.load_style_profile", lambda: "")
+    monkeypatch.setattr("sensei.reviewer.load_project_rules", lambda project_path: "")
+    monkeypatch.setattr("sensei.reviewer.load_project_rules_from_repo", lambda client, project_path, ref: "")
+    monkeypatch.setattr("sensei.reviewer.review_mr_files", lambda *args, **kwargs: [])
+    monkeypatch.setattr("sensei.review_cache.load_review_artifact", lambda *args, **kwargs: None)
+    monkeypatch.setattr("sensei.review_cache.save_review_artifact", lambda **kwargs: "/tmp/review.json")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["review", "https://github.com/org/proj/pull/7"], input="discard\n")
+
+    assert result.exit_code == 0
+    assert "Fetching PR #7 from org/proj" in result.output
+
+
+def test_post_supports_github_pr_urls(monkeypatch, tmp_path):
+    review_file = tmp_path / "review.md"
+    review_file.write_text("Code Review: Looks good.")
+
+    mock_client = MagicMock()
+    monkeypatch.setattr("sensei.github_client.GitHubClient", lambda *args, **kwargs: mock_client)
+    monkeypatch.setattr("sensei.config.load_config", lambda: {})
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["post", "https://github.com/org/proj/pull/7", str(review_file)],
+    )
+
+    assert result.exit_code == 0
+    mock_client.post_mr_comment.assert_called_once_with(
+        "org/proj", 7, "Code Review: Looks good."
+    )

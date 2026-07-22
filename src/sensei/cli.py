@@ -1,5 +1,7 @@
 from pathlib import Path
 import re
+import shutil
+import subprocess
 from typing import Callable, Optional
 import click
 from sensei.llm_cli import (
@@ -43,8 +45,64 @@ DESCRIPTION_PLACEHOLDERS = (
 
 @click.group()
 def main():
-    """Sensei: AI-powered GitLab MR reviewer."""
+    """Sensei: AI-powered GitLab MR and GitHub PR reviewer."""
     pass
+
+
+def _create_review_client(target: dict, config: dict):
+    if target["provider"] == "gitlab":
+        from sensei.gitlab_client import GitLabClient
+
+        return GitLabClient(config["gitlab_url"], config["gitlab_pat"])
+
+    if target["provider"] == "github":
+        from sensei.github_client import GitHubClient
+
+        return GitHubClient(str(target["host"]))
+
+    raise ValueError(f"Unsupported review provider: {target['provider']}")
+
+
+def _get_github_cli_status() -> dict:
+    path = shutil.which("gh")
+    if not path:
+        return {
+            "installed": False,
+            "authenticated": False,
+            "detail": "Not installed",
+            "path": "",
+        }
+
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        return {
+            "installed": True,
+            "authenticated": False,
+            "detail": f"Status check failed: {exc}",
+            "path": path,
+        }
+
+    if result.returncode == 0:
+        return {
+            "installed": True,
+            "authenticated": True,
+            "detail": "Authenticated",
+            "path": path,
+        }
+
+    detail = (result.stderr or result.stdout or "").strip() or "Not authenticated"
+    return {
+        "installed": True,
+        "authenticated": False,
+        "detail": detail,
+        "path": path,
+    }
 
 
 def _apply_ai_overrides(
@@ -330,7 +388,7 @@ def use_ai(ai_cli, model, fallback_ai):
 
 @main.command()
 def doctor():
-    """Show AI CLI availability and auth health."""
+    """Show AI and review-provider availability and auth health."""
     from sensei.config import load_config
 
     config = load_config()
@@ -358,6 +416,16 @@ def doctor():
         if status.get("path"):
             click.echo(f"  path: {status['path']}")
         click.echo(f"  detail: {status.get('detail', 'Unknown')}")
+
+    github_status = _get_github_cli_status()
+    click.echo(
+        "GitHub CLI: "
+        f"installed={'yes' if github_status['installed'] else 'no'}, "
+        f"authenticated={'yes' if github_status.get('authenticated') else 'no'}"
+    )
+    if github_status.get("path"):
+        click.echo(f"  path: {github_status['path']}")
+    click.echo(f"  detail: {github_status.get('detail', 'Unknown')}")
 
 
 @main.command()
@@ -507,7 +575,7 @@ def _post_review_results(
     diff_lines_map: dict,
     existing: set,
 ) -> tuple:
-    """Post review comments to GitLab. Returns (inline_posted, nits_posted, test_posted, skipped)."""
+    """Post review comments. Returns (inline_posted, nits_posted, test_posted, skipped)."""
     from sensei.formatter import format_inline_comment, format_nits_summary
     from sensei.gitlab_client import build_body_signature, build_inline_signature
 
@@ -619,7 +687,7 @@ def _handle_approval(client, result: dict, dry_run: bool) -> None:
             if f["diff"]:
                 diff_lines_map[f["new_path"]] = extract_diff_lines(f["diff"])
 
-        click.echo("Posting comments to GitLab...")
+        click.echo("Posting review comments...")
         inline_posted, nits_posted, test_posted, skipped = _post_review_results(
             client=client,
             project_path=project_path,
@@ -661,9 +729,9 @@ def _handle_approval(client, result: dict, dry_run: bool) -> None:
 @click.option("--auto-ai", "ai_cli_override", flag_value="auto", help="Use auto backend selection for this run")
 @click.option("--model", "model_override", default=None, help="Optional model override for this run")
 def review(mr_url, dry_run, fresh, ai_cli_override, model_override):
-    """Review a GitLab Merge Request."""
+    """Review a GitLab merge request or GitHub pull request."""
     from sensei.config import load_config
-    from sensei.gitlab_client import parse_mr_url, validate_mr_url_origin, GitLabClient
+    from sensei.review_platform import parse_review_url, validate_review_target
     from sensei.reviewer import (
         review_mr_files,
         consolidate_test_comments,
@@ -682,14 +750,17 @@ def review(mr_url, dry_run, fresh, ai_cli_override, model_override):
     config = _apply_ai_overrides(config, ai_cli_override, model_override)
     config["_status_callback"] = lambda message: click.echo(message, err=True)
     try:
-        project_path, mr_iid = parse_mr_url(mr_url)
-        validate_mr_url_origin(mr_url, config["gitlab_url"])
+        target = parse_review_url(mr_url)
+        validate_review_target(target, config)
     except ValueError as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1)
 
-    click.echo(f"Fetching MR !{mr_iid} from {project_path}...")
-    client = GitLabClient(config["gitlab_url"], config["gitlab_pat"])
+    project_path = str(target["project_path"])
+    mr_iid = int(target["review_id"])
+
+    click.echo(f"Fetching {target['label']} from {project_path}...")
+    client = _create_review_client(target, config)
     mr_data = client.get_mr_diff(project_path, mr_iid)
 
     click.echo(f"MR: {mr_data['title']}")
@@ -791,15 +862,18 @@ def review(mr_url, dry_run, fresh, ai_cli_override, model_override):
 @click.argument("mr_url")
 @click.argument("review_file", type=click.Path(exists=True))
 def post(mr_url, review_file):
-    """Post an edited review file to a GitLab MR."""
+    """Post an edited review file to a GitLab MR or GitHub PR."""
     from sensei.config import load_config
-    from sensei.gitlab_client import parse_mr_url, GitLabClient
+    from sensei.review_platform import parse_review_url, validate_review_target
 
     config = load_config()
-    project_path, mr_iid = parse_mr_url(mr_url)
+    target = parse_review_url(mr_url)
+    validate_review_target(target, config)
+    project_path = str(target["project_path"])
+    mr_iid = int(target["review_id"])
     body = Path(review_file).read_text()
 
-    client = GitLabClient(config["gitlab_url"], config["gitlab_pat"])
+    client = _create_review_client(target, config)
     client.post_mr_comment(project_path, mr_iid, body)
     click.echo("Review posted!")
 
@@ -810,13 +884,13 @@ def post(mr_url, review_file):
 @click.option("--concurrency", default=3, type=click.IntRange(1, 10), help="Max parallel reviews (1-10)")
 @click.option("--dry-run", is_flag=True, help="Show results without approval prompt")
 def review_batch(urls, url_file, concurrency, dry_run):
-    """Review multiple GitLab MRs in parallel.
+    """Review multiple GitLab MRs or GitHub PRs in parallel.
 
     Pass URLs as arguments or use --file with a file containing one URL per line.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from sensei.config import load_config
-    from sensei.gitlab_client import parse_mr_url, validate_mr_url_origin, GitLabClient
+    from sensei.review_platform import parse_review_url, validate_review_target
     from sensei.formatter import format_review, format_batch_progress
 
     # Merge URLs from args and --file
@@ -852,16 +926,14 @@ def review_batch(urls, url_file, concurrency, dry_run):
     parsed = []
     for url in all_urls:
         try:
-            project_path, mr_iid = parse_mr_url(url)
-            validate_mr_url_origin(url, config["gitlab_url"])
-            parsed.append((url, project_path, mr_iid))
+            target = parse_review_url(url)
+            validate_review_target(target, config)
+            parsed.append((url, target))
         except ValueError as e:
             click.echo(f"Error: {e}", err=True)
             raise SystemExit(1)
 
-    client = GitLabClient(config["gitlab_url"], config["gitlab_pat"])
-
-    click.echo(f"Reviewing {len(parsed)} MRs with concurrency={concurrency}...")
+    click.echo(f"Reviewing {len(parsed)} items with concurrency={concurrency}...")
 
     import threading
     progress_lock = threading.Lock()
@@ -871,12 +943,22 @@ def review_batch(urls, url_file, concurrency, dry_run):
             click.echo(format_batch_progress(mr_iid, project_path, status), err=True)
 
     results_map = {}
+    clients = {}
+
+    def get_client(target):
+        key = (target["provider"], target["host"])
+        if key not in clients:
+            clients[key] = _create_review_client(target, config)
+        return clients[key]
+
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         future_to_parsed = {}
-        for url, project_path, mr_iid in parsed:
+        for url, target in parsed:
+            project_path = str(target["project_path"])
+            mr_iid = int(target["review_id"])
             future = pool.submit(
                 _review_single_mr,
-                client=client,
+                client=get_client(target),
                 config=config,
                 project_path=project_path,
                 mr_iid=mr_iid,
@@ -901,11 +983,13 @@ def review_batch(urls, url_file, concurrency, dry_run):
                 }
 
     # Sequential results + approval in input order
-    for url, project_path, mr_iid in parsed:
+    for url, target in parsed:
+        project_path = str(target["project_path"])
+        mr_iid = int(target["review_id"])
         result = results_map[url]
 
         click.echo(f"\n{'=' * 60}")
-        click.echo(f"MR !{mr_iid} — {project_path}")
+        click.echo(f"{target['label']} — {project_path}")
         click.echo("=" * 60)
 
         if result.get("error"):
@@ -916,7 +1000,7 @@ def review_batch(urls, url_file, concurrency, dry_run):
         click.echo(f"Title: {mr_data['title']}")
         click.echo(format_review(result["comments"], result["test_summary"]))
 
-        _handle_approval(client, result, dry_run)
+        _handle_approval(get_client(target), result, dry_run)
 
     click.echo("\nBatch review complete.")
 

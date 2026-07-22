@@ -108,7 +108,10 @@ class GitLabClient:
         project = self.gl.projects.get(project_path)
         try:
             f = project.files.get(file_path=file_path, ref=ref)
-            return f.decode().decode("utf-8")
+            try:
+                return f.decode().decode("utf-8")
+            except UnicodeDecodeError:
+                return ""
         except gitlab.exceptions.GitlabGetError:
             return ""
 

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import gitlab
+
 from sensei.gitlab_client import (
     GitLabClient,
     build_body_signature,
@@ -76,3 +78,34 @@ def test_get_existing_comments_uses_typed_signatures():
     assert build_inline_signature("src/app.py", 14) in signatures
     assert build_body_signature("Code Review: Fix the nil check.") in signatures
     assert build_body_signature(general_note.body) in signatures
+
+
+def test_get_file_content_returns_empty_for_binary_file():
+    client = GitLabClient.__new__(GitLabClient)
+    binary_file = SimpleNamespace(
+        decode=lambda: b"\x89PNG\r\n\x1a\n"
+    )
+    project = SimpleNamespace(
+        files=SimpleNamespace(get=lambda **kwargs: binary_file)
+    )
+    client.gl = SimpleNamespace(
+        projects=SimpleNamespace(get=lambda project_path: project)
+    )
+
+    assert client.get_file_content("org/proj", "image.png", "main") == ""
+
+
+def test_get_file_content_returns_empty_when_gitlab_file_missing():
+    client = GitLabClient.__new__(GitLabClient)
+
+    def raise_missing(**kwargs):
+        raise gitlab.exceptions.GitlabGetError(error_message="missing", response_code=404)
+
+    project = SimpleNamespace(
+        files=SimpleNamespace(get=raise_missing)
+    )
+    client.gl = SimpleNamespace(
+        projects=SimpleNamespace(get=lambda project_path: project)
+    )
+
+    assert client.get_file_content("org/proj", "missing.txt", "main") == ""
