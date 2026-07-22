@@ -48,6 +48,16 @@ REVIEW_OUTPUT_SCHEMA = {
     },
 }
 
+SIMILARITY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["skip", "reply", "post_new"]},
+        "reply_body": {"type": "string"},
+    },
+    "required": ["action", "reply_body"],
+    "additionalProperties": False,
+}
+
 
 def normalize_ai_cli(value: Optional[str]) -> str:
     if not value:

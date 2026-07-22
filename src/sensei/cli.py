@@ -574,11 +574,15 @@ def _post_review_results(
     test_summary: Optional[str],
     diff_lines_map: dict,
     existing: set,
+    others: Optional[dict] = None,
+    ai_config: Optional[dict] = None,
 ) -> tuple:
     """Post review comments. Returns (inline_posted, nits_posted, test_posted, skipped)."""
     from sensei.formatter import format_inline_comment, format_nits_summary
     from sensei.gitlab_client import build_body_signature, build_inline_signature
+    from sensei.reviewer import judge_similarity
 
+    others = others or {}
     musts = [c for c in comments if c.get("type") == "must"]
     nits = [c for c in comments if c.get("type") == "nit"]
 
@@ -588,6 +592,28 @@ def _post_review_results(
     for c in musts:
         if c["line"] == 0:
             continue
+
+        other_threads = others.get((c["file"], c["line"]))
+        if other_threads:
+            verdict = judge_similarity(c, other_threads, c["file"], ai_config or {})
+            if verdict["action"] == "skip":
+                skipped += 1
+                continue
+            if verdict["action"] == "reply":
+                thread = other_threads[0]
+                try:
+                    if "discussion_id" in thread:
+                        client.reply_to_discussion(
+                            project_path, mr_iid, thread["discussion_id"], verdict["reply_body"]
+                        )
+                    else:
+                        client.reply_to_comment(
+                            project_path, mr_iid, thread["comment_id"], verdict["reply_body"]
+                        )
+                    inline_posted += 1
+                except Exception as e:
+                    click.echo(f"  Reply failed for {c['file']}:L{c['line']}: {e}")
+                continue
 
         body = format_inline_comment(c)
         file_body = f"**`{c['file']}` L{c['line']}**\n\n{body}"
@@ -655,7 +681,7 @@ def _post_review_results(
     return (inline_posted, nits_posted, test_posted, skipped)
 
 
-def _handle_approval(client, result: dict, dry_run: bool) -> None:
+def _handle_approval(client, result: dict, dry_run: bool, ai_config: Optional[dict] = None) -> None:
     """Prompt the user to approve, edit, or discard a review result."""
     from sensei.gitlab_client import extract_diff_lines
     from sensei.formatter import format_for_gitlab
@@ -681,6 +707,7 @@ def _handle_approval(client, result: dict, dry_run: bool) -> None:
     if action == "approve":
         click.echo("Checking for existing comments...")
         existing = client.get_existing_comments(project_path, mr_iid)
+        others = client.get_other_reviewer_comments(project_path, mr_iid)
 
         diff_lines_map = {}
         for f in mr_data["files"]:
@@ -695,6 +722,8 @@ def _handle_approval(client, result: dict, dry_run: bool) -> None:
             mr_data=mr_data,
             comments=comments,
             test_summary=test_summary,
+            others=others,
+            ai_config=ai_config,
             diff_lines_map=diff_lines_map,
             existing=existing,
         )
@@ -855,6 +884,7 @@ def review(mr_url, dry_run, fresh, ai_cli_override, model_override):
             "test_summary": test_summary,
         },
         dry_run=dry_run,
+        ai_config=config,
     )
 
 
@@ -1000,7 +1030,7 @@ def review_batch(urls, url_file, concurrency, dry_run):
         click.echo(f"Title: {mr_data['title']}")
         click.echo(format_review(result["comments"], result["test_summary"]))
 
-        _handle_approval(get_client(target), result, dry_run)
+        _handle_approval(get_client(target), result, dry_run, ai_config=config)
 
     click.echo("\nBatch review complete.")
 

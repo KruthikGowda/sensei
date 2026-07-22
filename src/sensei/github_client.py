@@ -136,6 +136,47 @@ class GitHubClient:
 
         return signatures
 
+    def get_other_reviewer_comments(self, project_path: str, mr_iid: int) -> dict:
+        """Fetch inline review comments left by anyone other than the current user.
+
+        Returns a dict keyed by (file_path, line_number) to a list of
+        {"comment_id": int, "body": str, "author": str} threads, so callers
+        can decide whether to skip, reply, or post a fresh comment at that spot.
+        """
+        current_user = self.get_current_username()
+        others = {}
+
+        review_comments = self._paginate(f"repos/{project_path}/pulls/{mr_iid}/comments")
+        for note in review_comments:
+            author = note.get("user", {}).get("login")
+            if not author or author == current_user:
+                continue
+            if not (note.get("path") and note.get("line")):
+                continue
+            key = (note["path"], note["line"])
+            others.setdefault(key, []).append({
+                "comment_id": note["id"],
+                "body": note.get("body", ""),
+                "author": author,
+            })
+
+        return others
+
+    def reply_to_comment(
+        self, project_path: str, mr_iid: int, comment_id: int, body: str
+    ) -> None:
+        """Reply inline within an existing review comment thread."""
+        self._gh([
+            "api",
+            "--method",
+            "POST",
+            f"repos/{project_path}/pulls/{mr_iid}/comments",
+            "-f",
+            f"body={body}",
+            "-F",
+            f"in_reply_to={comment_id}",
+        ])
+
     def post_mr_comment(self, project_path: str, mr_iid: int, body: str) -> None:
         self._gh([
             "api",

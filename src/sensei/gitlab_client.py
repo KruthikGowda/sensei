@@ -146,6 +146,44 @@ class GitLabClient:
 
         return signatures
 
+    def get_other_reviewer_comments(self, project_path: str, mr_iid: int) -> dict:
+        """Fetch inline comments left by anyone other than the current user.
+
+        Returns a dict keyed by (file_path, line_number) to a list of
+        {"discussion_id": str, "body": str, "author": str} threads, so callers
+        can decide whether to skip, reply, or post a fresh comment at that spot.
+        """
+        project = self.gl.projects.get(project_path)
+        mr = project.mergerequests.get(mr_iid)
+        current_user = self.gl.user.username
+        others = {}
+
+        for discussion in mr.discussions.list(per_page=100, iterator=True):
+            for note in discussion.attributes.get("notes", []):
+                author = note.get("author", {}).get("username")
+                if not author or author == current_user:
+                    continue
+                pos = note.get("position")
+                if not (pos and pos.get("new_path") and pos.get("new_line")):
+                    continue
+                key = (pos["new_path"], pos["new_line"])
+                others.setdefault(key, []).append({
+                    "discussion_id": discussion.id,
+                    "body": note.get("body", ""),
+                    "author": author,
+                })
+
+        return others
+
+    def reply_to_discussion(
+        self, project_path: str, mr_iid: int, discussion_id: str, body: str
+    ) -> None:
+        """Reply inline within an existing discussion thread."""
+        project = self.gl.projects.get(project_path)
+        mr = project.mergerequests.get(mr_iid)
+        discussion = mr.discussions.get(discussion_id)
+        discussion.notes.create({"body": body})
+
     def post_mr_comment(
         self, project_path: str, mr_iid: int, body: str
     ) -> None:

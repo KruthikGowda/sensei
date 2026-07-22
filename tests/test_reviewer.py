@@ -1,4 +1,4 @@
-from sensei.reviewer import build_file_review_prompt, parse_json_review, parse_review_output, consolidate_test_comments, load_project_rules_from_repo, _has_error_handling, review_file
+from sensei.reviewer import build_file_review_prompt, build_similarity_prompt, judge_similarity, parse_json_review, parse_review_output, consolidate_test_comments, load_project_rules_from_repo, _has_error_handling, review_file
 
 
 def test_build_file_review_prompt_includes_diff():
@@ -20,6 +20,7 @@ def test_build_file_review_prompt_includes_diff():
     assert "required plan updates" in prompt
     assert "Setu components" in prompt
     assert "existing chart wrappers" in prompt
+    assert "lint/CI already enforces" in prompt
 
 
 def test_build_file_review_prompt_uses_diff_only_for_lockfiles():
@@ -268,3 +269,84 @@ def test_review_file_preserves_comment_types_for_any_provider(monkeypatch):
     assert comments[0]["line"] == 12
     assert comments[1]["line"] == 18
     assert comments[2]["line"] == 22
+
+
+def test_build_similarity_prompt_includes_draft_and_existing_comments():
+    prompt = build_similarity_prompt(
+        draft_comment={"line": 10, "body": "Code Review: null check missing."},
+        existing_comments=[{"author": "alice", "body": "Same issue, please fix."}],
+        file_path="src/app.py",
+    )
+    assert "src/app.py" in prompt
+    assert "null check missing" in prompt
+    assert "alice" in prompt
+    assert "Same issue, please fix." in prompt
+    assert '"action"' in prompt
+
+
+def test_judge_similarity_returns_post_new_when_no_existing_comments():
+    result = judge_similarity(
+        draft_comment={"line": 10, "body": "Bug here"},
+        existing_comments=[],
+        file_path="src/app.py",
+        ai_config={},
+    )
+    assert result == {"action": "post_new", "reply_body": ""}
+
+
+def test_judge_similarity_parses_skip_verdict(monkeypatch):
+    monkeypatch.setattr(
+        "sensei.reviewer.run_prompt",
+        lambda prompt, timeout, config, schema, reasoning_effort=None: '{"action": "skip", "reply_body": ""}',
+    )
+    result = judge_similarity(
+        draft_comment={"line": 10, "body": "Bug here"},
+        existing_comments=[{"author": "alice", "body": "Bug here too"}],
+        file_path="src/app.py",
+        ai_config={},
+    )
+    assert result == {"action": "skip", "reply_body": ""}
+
+
+def test_judge_similarity_parses_reply_verdict(monkeypatch):
+    monkeypatch.setattr(
+        "sensei.reviewer.run_prompt",
+        lambda prompt, timeout, config, schema, reasoning_effort=None: (
+            '{"action": "reply", "reply_body": "Also handles the empty-array case."}'
+        ),
+    )
+    result = judge_similarity(
+        draft_comment={"line": 10, "body": "Bug here"},
+        existing_comments=[{"author": "alice", "body": "Similar bug"}],
+        file_path="src/app.py",
+        ai_config={},
+    )
+    assert result == {"action": "reply", "reply_body": "Also handles the empty-array case."}
+
+
+def test_judge_similarity_fails_open_to_post_new_on_malformed_output(monkeypatch):
+    monkeypatch.setattr(
+        "sensei.reviewer.run_prompt",
+        lambda prompt, timeout, config, schema, reasoning_effort=None: "not json",
+    )
+    result = judge_similarity(
+        draft_comment={"line": 10, "body": "Bug here"},
+        existing_comments=[{"author": "alice", "body": "Similar bug"}],
+        file_path="src/app.py",
+        ai_config={},
+    )
+    assert result == {"action": "post_new", "reply_body": ""}
+
+
+def test_judge_similarity_fails_open_to_post_new_on_runtime_error(monkeypatch):
+    def _raise(*args, **kwargs):
+        raise RuntimeError("AI CLI unavailable")
+
+    monkeypatch.setattr("sensei.reviewer.run_prompt", _raise)
+    result = judge_similarity(
+        draft_comment={"line": 10, "body": "Bug here"},
+        existing_comments=[{"author": "alice", "body": "Similar bug"}],
+        file_path="src/app.py",
+        ai_config={},
+    )
+    assert result == {"action": "post_new", "reply_body": ""}

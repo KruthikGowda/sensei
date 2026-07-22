@@ -3,7 +3,7 @@ import re
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sensei.config import CONFIG_DIR
-from sensei.llm_cli import REVIEW_OUTPUT_SCHEMA, run_prompt
+from sensei.llm_cli import REVIEW_OUTPUT_SCHEMA, SIMILARITY_SCHEMA, run_prompt
 
 GENERATED_REVIEW_BASENAMES = {
     "bun.lock",
@@ -38,6 +38,11 @@ def build_file_review_prompt(
 
 ## Project Rules
 {project_rules}
+
+If a rule above is the kind of thing lint/CI already enforces (naming casing, arg-count
+limits, formatting, import order), don't flag it here unless the diff violates it in a way
+lint wouldn't catch — spend your attention on judgment calls instead (architecture, silent
+failures, SRP, security).
 
 ## MR Context
 {mr_context}
@@ -158,6 +163,73 @@ Return a valid JSON array. Each element:
 If no issues found, return: []
 
 Return ONLY the JSON array."""
+
+
+def build_similarity_prompt(
+    draft_comment: dict, existing_comments: list, file_path: str
+) -> str:
+    existing_block = "\n\n".join(
+        f'- ({c.get("author", "unknown")}): {c.get("body", "")}' for c in existing_comments
+    )
+    return f"""You are deciding whether a draft code-review comment duplicates comments other reviewers already left at the same spot in a merge request, so we don't bloat the review thread.
+
+## File
+{file_path} (L{draft_comment.get("line")})
+
+## Our draft comment
+{draft_comment.get("body", "")}
+
+## Comment(s) already posted here by other reviewers
+{existing_block}
+
+## Decide
+- "skip": the other reviewer(s) already made this exact point — ours adds nothing.
+- "reply": it's the same underlying issue, but our draft has extra clarity, a concrete fix, or a detail they missed. Write ONLY that incremental point as "reply_body" — do not restate what's already been said. Keep it as short as our normal review comments (a sentence or two, "Suggestion:" line if it's a fix).
+- "post_new": the existing comment(s) are about something else entirely; ours should be posted as its own comment.
+
+## Output Format
+Return a JSON object: {{"action": "skip"|"reply"|"post_new", "reply_body": string}}. Set "reply_body" to an empty string unless action is "reply".
+
+Return ONLY the JSON object, nothing else."""
+
+
+def judge_similarity(
+    draft_comment: dict, existing_comments: list, file_path: str, ai_config: dict
+) -> dict:
+    """Decide whether a draft comment duplicates another reviewer's existing comment.
+
+    Fails open to {"action": "post_new"} on any parse/runtime error, since a
+    missed dedup is far cheaper than silently dropping a review finding.
+    """
+    fallback = {"action": "post_new", "reply_body": ""}
+    if not existing_comments:
+        return fallback
+
+    prompt = build_similarity_prompt(draft_comment, existing_comments, file_path)
+    try:
+        raw = run_prompt(
+            prompt,
+            timeout=60,
+            config=ai_config,
+            schema=SIMILARITY_SCHEMA,
+            reasoning_effort=REVIEW_REASONING_EFFORT,
+        )
+    except RuntimeError:
+        return fallback
+
+    try:
+        parsed = json.loads(raw.strip())
+    except json.JSONDecodeError:
+        return fallback
+
+    if not isinstance(parsed, dict):
+        return fallback
+
+    action = parsed.get("action")
+    if action not in ("skip", "reply", "post_new"):
+        return fallback
+
+    return {"action": action, "reply_body": parsed.get("reply_body", "") or ""}
 
 
 def _build_file_context(file_path: str, diff: str, file_content: str) -> tuple:

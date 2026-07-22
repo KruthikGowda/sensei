@@ -206,6 +206,112 @@ def test_post_review_results_skips_existing_general_summary_comments():
     mock_client.post_mr_comment.assert_not_called()
 
 
+def test_post_review_results_skips_when_other_reviewer_already_covered_it():
+    mock_client = MagicMock()
+    comments = [{"file": "src/app.tsx", "line": 10, "confidence": 95, "type": "must", "body": "Bug here"}]
+    diff_lines_map = {"src/app.tsx": {10}}
+    mr_data = {"base_sha": "a", "head_sha": "b", "start_sha": "c", "files": []}
+    others = {("src/app.tsx", 10): [{"discussion_id": "d1", "body": "already flagged this", "author": "alice"}]}
+
+    from sensei.cli import _post_review_results
+    with patch("sensei.reviewer.judge_similarity", return_value={"action": "skip", "reply_body": ""}):
+        inline_posted, nits_posted, test_posted, skipped = _post_review_results(
+            client=mock_client, project_path="org/proj", mr_iid=1,
+            mr_data=mr_data, comments=comments, test_summary=None,
+            diff_lines_map=diff_lines_map, existing=set(), others=others, ai_config={},
+        )
+
+    assert (inline_posted, nits_posted, test_posted, skipped) == (0, 0, 0, 1)
+    mock_client.post_inline_comment.assert_not_called()
+    mock_client.reply_to_discussion.assert_not_called()
+
+
+def test_post_review_results_replies_in_gitlab_thread_when_similar_with_delta():
+    mock_client = MagicMock()
+    comments = [{"file": "src/app.tsx", "line": 10, "confidence": 95, "type": "must", "body": "Bug here"}]
+    diff_lines_map = {"src/app.tsx": {10}}
+    mr_data = {"base_sha": "a", "head_sha": "b", "start_sha": "c", "files": []}
+    others = {("src/app.tsx", 10): [{"discussion_id": "d1", "body": "already flagged this", "author": "alice"}]}
+
+    from sensei.cli import _post_review_results
+    with patch(
+        "sensei.reviewer.judge_similarity",
+        return_value={"action": "reply", "reply_body": "Also: this crashes on empty input."},
+    ):
+        inline_posted, nits_posted, test_posted, skipped = _post_review_results(
+            client=mock_client, project_path="org/proj", mr_iid=1,
+            mr_data=mr_data, comments=comments, test_summary=None,
+            diff_lines_map=diff_lines_map, existing=set(), others=others, ai_config={},
+        )
+
+    assert (inline_posted, nits_posted, test_posted, skipped) == (1, 0, 0, 0)
+    mock_client.reply_to_discussion.assert_called_once_with(
+        "org/proj", 1, "d1", "Also: this crashes on empty input."
+    )
+    mock_client.post_inline_comment.assert_not_called()
+
+
+def test_post_review_results_replies_in_github_thread_via_comment_id():
+    mock_client = MagicMock()
+    comments = [{"file": "src/app.tsx", "line": 10, "confidence": 95, "type": "must", "body": "Bug here"}]
+    diff_lines_map = {"src/app.tsx": {10}}
+    mr_data = {"base_sha": "a", "head_sha": "b", "start_sha": "c", "files": []}
+    others = {("src/app.tsx", 10): [{"comment_id": 42, "body": "already flagged this", "author": "alice"}]}
+
+    from sensei.cli import _post_review_results
+    with patch(
+        "sensei.reviewer.judge_similarity",
+        return_value={"action": "reply", "reply_body": "Also: this crashes on empty input."},
+    ):
+        _post_review_results(
+            client=mock_client, project_path="org/repo", mr_iid=7,
+            mr_data=mr_data, comments=comments, test_summary=None,
+            diff_lines_map=diff_lines_map, existing=set(), others=others, ai_config={},
+        )
+
+    mock_client.reply_to_comment.assert_called_once_with(
+        "org/repo", 7, 42, "Also: this crashes on empty input."
+    )
+
+
+def test_post_review_results_posts_new_when_unrelated_to_existing_comment():
+    mock_client = MagicMock()
+    comments = [{"file": "src/app.tsx", "line": 10, "confidence": 95, "type": "must", "body": "Bug here"}]
+    diff_lines_map = {"src/app.tsx": {10}}
+    mr_data = {"base_sha": "a", "head_sha": "b", "start_sha": "c", "files": []}
+    others = {("src/app.tsx", 10): [{"discussion_id": "d1", "body": "unrelated nit", "author": "alice"}]}
+
+    from sensei.cli import _post_review_results
+    with patch("sensei.reviewer.judge_similarity", return_value={"action": "post_new", "reply_body": ""}):
+        inline_posted, nits_posted, test_posted, skipped = _post_review_results(
+            client=mock_client, project_path="org/proj", mr_iid=1,
+            mr_data=mr_data, comments=comments, test_summary=None,
+            diff_lines_map=diff_lines_map, existing=set(), others=others, ai_config={},
+        )
+
+    assert (inline_posted, nits_posted, test_posted, skipped) == (1, 0, 0, 0)
+    mock_client.post_inline_comment.assert_called_once()
+    mock_client.reply_to_discussion.assert_not_called()
+
+
+def test_post_review_results_skips_similarity_check_when_no_other_comments_there():
+    mock_client = MagicMock()
+    comments = [{"file": "src/app.tsx", "line": 10, "confidence": 95, "type": "must", "body": "Bug here"}]
+    diff_lines_map = {"src/app.tsx": {10}}
+    mr_data = {"base_sha": "a", "head_sha": "b", "start_sha": "c", "files": []}
+
+    from sensei.cli import _post_review_results
+    with patch("sensei.reviewer.judge_similarity") as mock_judge:
+        _post_review_results(
+            client=mock_client, project_path="org/proj", mr_iid=1,
+            mr_data=mr_data, comments=comments, test_summary=None,
+            diff_lines_map=diff_lines_map, existing=set(), others={}, ai_config={},
+        )
+
+    mock_judge.assert_not_called()
+    mock_client.post_inline_comment.assert_called_once()
+
+
 def test_set_ai_updates_config(tmp_path, monkeypatch):
     config_dir = tmp_path / ".sensei"
     monkeypatch.setattr("sensei.config.CONFIG_DIR", config_dir)

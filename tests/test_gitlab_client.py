@@ -80,6 +80,62 @@ def test_get_existing_comments_uses_typed_signatures():
     assert build_body_signature(general_note.body) in signatures
 
 
+def test_get_other_reviewer_comments_excludes_current_user():
+    client = GitLabClient.__new__(GitLabClient)
+
+    own_note = {
+        "author": {"username": "sensei"},
+        "body": "My own earlier comment.",
+        "position": {"new_path": "src/app.py", "new_line": 14},
+    }
+    other_note = {
+        "author": {"username": "alice"},
+        "body": "Fix the nil check.",
+        "position": {"new_path": "src/app.py", "new_line": 14},
+    }
+    unpositioned_note = {
+        "author": {"username": "bob"},
+        "body": "General comment, no position.",
+    }
+
+    discussions = SimpleNamespace(
+        list=lambda **kwargs: [
+            SimpleNamespace(id="disc-1", attributes={"notes": [own_note, other_note]}),
+            SimpleNamespace(id="disc-2", attributes={"notes": [unpositioned_note]}),
+        ]
+    )
+    mr = SimpleNamespace(discussions=discussions)
+    project = SimpleNamespace(mergerequests=SimpleNamespace(get=lambda mr_iid: mr))
+    client.gl = SimpleNamespace(
+        user=SimpleNamespace(username="sensei"),
+        projects=SimpleNamespace(get=lambda project_path: project),
+    )
+
+    others = client.get_other_reviewer_comments("org/proj", 1)
+
+    assert others == {
+        ("src/app.py", 14): [
+            {"discussion_id": "disc-1", "body": "Fix the nil check.", "author": "alice"}
+        ]
+    }
+
+
+def test_reply_to_discussion_creates_note_on_existing_discussion():
+    client = GitLabClient.__new__(GitLabClient)
+    created = {}
+
+    discussion = SimpleNamespace(
+        notes=SimpleNamespace(create=lambda payload: created.update(payload))
+    )
+    mr = SimpleNamespace(discussions=SimpleNamespace(get=lambda discussion_id: discussion))
+    project = SimpleNamespace(mergerequests=SimpleNamespace(get=lambda mr_iid: mr))
+    client.gl = SimpleNamespace(projects=SimpleNamespace(get=lambda project_path: project))
+
+    client.reply_to_discussion("org/proj", 1, "disc-1", "Also handles the empty-array case.")
+
+    assert created == {"body": "Also handles the empty-array case."}
+
+
 def test_get_file_content_returns_empty_for_binary_file():
     client = GitLabClient.__new__(GitLabClient)
     binary_file = SimpleNamespace(
