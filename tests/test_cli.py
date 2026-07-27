@@ -430,6 +430,7 @@ def test_build_mr_description_comments_flags_placeholder_description():
             "## Preview URL\n<!-- Provide a preview URL -->\n"
             "## Screenshots\n<!-- Include screenshots or GIFs that demonstrate the changes -->\n"
         ),
+        "files": [{"new_path": "src/components/InvoiceTable.tsx"}],
     })
 
     assert len(comments) == 4
@@ -468,6 +469,7 @@ def test_build_mr_description_comments_flags_missing_preview_url():
             "## Screenshots\n"
             "![invoice table](https://preview.example.com/invoices.png)"
         ),
+        "files": [{"new_path": "src/components/InvoiceTable.tsx"}],
     })
 
     assert len(comments) == 1
@@ -484,6 +486,7 @@ def test_build_mr_description_comments_flags_missing_screenshot():
             "## Preview URL\n"
             "Preview: https://preview.example.com/invoices"
         ),
+        "files": [{"new_path": "src/components/InvoiceTable.tsx"}],
     })
 
     assert len(comments) == 1
@@ -501,6 +504,52 @@ def test_build_mr_description_comments_allows_complete_description():
             "Preview: https://preview.example.com/invoices\n"
             "## Screenshots\n"
             "![invoice table](/uploads/invoices.png)"
+        ),
+        "files": [{"new_path": "src/components/InvoiceTable.tsx"}],
+    })
+
+    assert comments == []
+
+
+def test_build_mr_description_comments_skips_preview_checks_for_non_ui_diff():
+    from sensei.cli import build_mr_description_comments
+
+    comments = build_mr_description_comments({
+        "description": (
+            "## Description\n"
+            "BRIDGE-2420 adds a manual security remediation trigger job to the pipeline.\n"
+            "## Preview URL\n"
+            "<!--Provide a preview URL-->"
+        ),
+        "files": [{"new_path": ".gitlab-ci.yml"}],
+    })
+
+    assert comments == []
+
+
+def test_build_mr_description_comments_flags_ui_files_outside_component_dirs():
+    from sensei.cli import build_mr_description_comments
+
+    comments = build_mr_description_comments({
+        "description": (
+            "## Description\n"
+            "BRIDGE-2254 restyles the invoice summary card for narrow viewports.\n"
+        ),
+        "files": [{"new_path": "app/invoice-summary.scss"}],
+    })
+
+    bodies = [comment["body"] for comment in comments]
+    assert any("preview URL" in body for body in bodies)
+    assert any("screenshots or screen recordings" in body for body in bodies)
+
+
+def test_build_mr_description_comments_stays_quiet_without_file_list():
+    from sensei.cli import build_mr_description_comments
+
+    comments = build_mr_description_comments({
+        "description": (
+            "## Description\n"
+            "BRIDGE-2254 adds the incoming invoice table and wires status filters for reviewers.\n"
         ),
     })
 

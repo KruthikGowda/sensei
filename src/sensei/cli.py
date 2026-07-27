@@ -35,6 +35,26 @@ SCREENSHOT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 SECTION_HEADER_PATTERN = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+UI_FILE_EXTENSIONS = (
+    ".tsx",
+    ".jsx",
+    ".vue",
+    ".svelte",
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    ".html",
+)
+UI_PATH_SEGMENTS = (
+    "components/",
+    "pages/",
+    "screens/",
+    "views/",
+    "layouts/",
+    "styles/",
+)
 DESCRIPTION_PLACEHOLDERS = (
     "<!-- provide a brief description",
     "<!-- provide a preview url",
@@ -193,6 +213,24 @@ def _section_has_visual_evidence(description: str, section_name: str) -> bool:
     return bool(URL_PATTERN.search(section) and _remove_template_lines(section))
 
 
+def _touches_ui_files(mr_data: dict) -> bool:
+    """Whether the diff contains files a reviewer could actually look at.
+
+    Preview links and screenshots only make sense for user-facing changes, so
+    config-, CI- or script-only MRs should never be asked for them. When the
+    caller passes no file list we cannot tell, and stay quiet rather than guess.
+    """
+    for entry in mr_data.get("files") or []:
+        path = (entry.get("new_path") or entry.get("old_path") or "").lower()
+        if not path:
+            continue
+        if path.endswith(UI_FILE_EXTENSIONS):
+            return True
+        if any(segment in path for segment in UI_PATH_SEGMENTS):
+            return True
+    return False
+
+
 def _drop_deprecated_metadata_comments(comments: list) -> list:
     """Remove stale metadata comments from older cached reviews."""
     deprecated_phrases = (
@@ -214,6 +252,7 @@ def build_mr_description_comments(mr_data: dict) -> list:
     """Generate metadata review comments for MR description conventions."""
     description = mr_data.get("description", "") or ""
     normalized_description = description.lower()
+    touches_ui = _touches_ui_files(mr_data)
     comments = []
 
     if not _description_has_real_content(description) or any(
@@ -250,7 +289,7 @@ def build_mr_description_comments(mr_data: dict) -> list:
             }
         )
 
-    if not _section_has_url(description, "Preview URL"):
+    if touches_ui and not _section_has_url(description, "Preview URL"):
         comments.append(
             {
                 "file": "Merge request metadata",
@@ -266,7 +305,7 @@ def build_mr_description_comments(mr_data: dict) -> list:
             }
         )
 
-    if not _section_has_visual_evidence(description, "Screenshots"):
+    if touches_ui and not _section_has_visual_evidence(description, "Screenshots"):
         comments.append(
             {
                 "file": "Merge request metadata",
