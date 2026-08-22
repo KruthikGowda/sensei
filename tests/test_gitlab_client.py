@@ -165,3 +165,46 @@ def test_get_file_content_returns_empty_when_gitlab_file_missing():
     )
 
     assert client.get_file_content("org/proj", "missing.txt", "main") == ""
+
+
+def test_no_newline_marker_does_not_shift_later_line_numbers():
+    """`\\ No newline at end of file` is a marker, not a line of the file.
+
+    Counting it as context advanced the new-side counter, so every added line
+    after it was reported one too high — which places a review comment on the
+    wrong line.
+    """
+    diff = (
+        "@@ -1,2 +1,2 @@\n"
+        "-old tail\n"
+        "+new tail\n"
+        "\\ No newline at end of file\n"
+        "+appended\n"
+    )
+
+    assert extract_diff_lines(diff) == {1, 2}
+
+
+def test_added_line_whose_content_starts_with_plus_is_not_skipped():
+    """A `+++` line inside a hunk is an addition, not a file header."""
+    diff = (
+        "--- a/f.py\n"
+        "+++ b/f.py\n"
+        "@@ -1,0 +1,2 @@\n"
+        "+++ this is content, not a header\n"
+        "+ordinary\n"
+    )
+
+    assert extract_diff_lines(diff) == {1, 2}
+
+
+def test_file_headers_before_the_hunk_do_not_advance_the_counter():
+    diff = (
+        "--- a/f.py\n"
+        "+++ b/f.py\n"
+        "@@ -1,1 +1,2 @@\n"
+        " context\n"
+        "+added\n"
+    )
+
+    assert extract_diff_lines(diff) == {2}

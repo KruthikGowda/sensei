@@ -22,16 +22,27 @@ def extract_diff_lines(diff: str) -> set:
     """Extract new-side line numbers that are part of the diff."""
     lines = set()
     current_line = 0
+    in_hunk = False
     for line in diff.splitlines():
         # Parse hunk headers: @@ -old,count +new,count @@
         hunk_match = re.match(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
         if hunk_match:
             current_line = int(hunk_match.group(1))
+            in_hunk = True
             continue
-        if line.startswith('+') and not line.startswith('+++'):
+        if not in_hunk:
+            # File headers (diff --git, index, ---, +++) precede the first hunk.
+            # Inside a hunk a leading +++ is content, not a header.
+            continue
+        if line.startswith('\\'):
+            # "\ No newline at end of file" is a marker, not a line of the
+            # file. Counting it advanced the counter and pushed every later
+            # added line one too high, misplacing review comments.
+            continue
+        if line.startswith('+'):
             lines.add(current_line)
             current_line += 1
-        elif line.startswith('-') and not line.startswith('---'):
+        elif line.startswith('-'):
             # Removed lines don't advance the new-side counter
             pass
         else:
